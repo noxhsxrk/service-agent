@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Repository Chat Assistant</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
+</head>
+<body class="bg-gray-100 h-screen">
+    <div class="container mx-auto p-4 h-full flex flex-col">
+        <!-- Header -->
+        <header class="bg-white rounded-lg shadow-md p-4 mb-4">
+            <div class="flex justify-between items-center">
+                <div>
+                    <h1 class="text-2xl font-bold text-gray-800">Repository Chat Assistant</h1>
+                    <p class="text-gray-600">Current repository path: {{ repos_path }}</p>
+                </div>
+                <div class="flex gap-2">
+                    <a href="/vector-store" 
+                       class="bg-purple-500 text-white px-4 py-2 rounded-lg hover:bg-purple-600 focus:outline-none flex items-center gap-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                  d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4" />
+                        </svg>
+                        Vector Store
+                    </a>
+                    <button id="reindex-button" 
+                            class="bg-green-500 text-white px-4 py-2 rounded-lg hover:bg-green-600 focus:outline-none flex items-center gap-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                        </svg>
+                        Reindex Repository
+                    </button>
+                </div>
+            </div>
+            <!-- Progress bar area -->
+            <div id="progress-area" class="mt-4 hidden">
+                <div class="mb-2 flex justify-between">
+                    <span id="progress-stage" class="text-sm font-medium text-gray-700"></span>
+                    <span id="progress-percentage" class="text-sm font-medium text-gray-700">0%</span>
+                </div>
+                <div class="w-full bg-gray-200 rounded-full h-2.5 mb-2">
+                    <div id="progress-bar" class="bg-blue-600 h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+                </div>
+                <!-- Console-like log display -->
+                <div id="log-display" class="mt-4 bg-gray-900 text-gray-100 rounded-lg p-3 font-mono text-sm h-32 overflow-y-auto">
+                    <div id="log-content" class="space-y-1"></div>
+                </div>
+            </div>
+
+            <!-- Notification area -->
+            <div id="notification" class="mt-4 p-4 rounded-lg hidden">
+                <!-- Will be populated by JavaScript -->
+            </div>
+        </header>
+
+        <!-- Chat Container -->
+        <div class="flex-1 bg-white rounded-lg shadow-md p-4 mb-4 overflow-hidden flex flex-col">
+            <!-- Messages Area -->
+            <div id="messages" class="flex-1 overflow-y-auto mb-4 space-y-4">
+                <!-- Messages will be added here -->
+            </div>
+
+            <!-- Input Area -->
+            <div class="border-t pt-4">
+                <form id="chat-form" class="flex gap-2">
+                    <div class="flex-1 relative">
+                        <input type="text" id="question" 
+                               class="w-full rounded-lg border border-gray-300 px-4 py-2 focus:outline-none focus:border-blue-500"
+                               placeholder="Ask a question about your repositories...">
+                        <!-- Repository suggestions dropdown -->
+                        <div id="repo-suggestions" class="absolute w-full bg-white border border-gray-200 rounded-lg shadow-lg mt-1 max-h-48 overflow-y-auto hidden">
+                            <!-- Suggestions will be added here -->
+                        </div>
+                    </div>
+                    <button type="submit" 
+                            class="bg-blue-500 text-white px-6 py-2 rounded-lg hover:bg-blue-600 focus:outline-none">
+                        Send
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const messagesContainer = document.getElementById('messages');
+        const chatForm = document.getElementById('chat-form');
+        const questionInput = document.getElementById('question');
+        const reindexButton = document.getElementById('reindex-button');
+        const notification = document.getElementById('notification');
+        const progressArea = document.getElementById('progress-area');
+        const progressBar = document.getElementById('progress-bar');
+        const progressStage = document.getElementById('progress-stage');
+        const progressPercentage = document.getElementById('progress-percentage');
+        const progressMessage = document.getElementById('progress-message');
+        const logContent = document.getElementById('log-content');
+        const logDisplay = document.getElementById('log-display');
+        const repoSuggestions = document.getElementById('repo-suggestions');
+        let repositories = [];
+        let showingSuggestions = false;
+
+        function addLogMessage(message, type = 'info') {
+            const logLine = document.createElement('div');
+            logLine.className = `log-line ${type} opacity-0 transition-opacity duration-200`;
+            
+            // Color-code different types of messages
+            const color = type === 'success' ? 'text-green-400' : 
+                         type === 'info' ? 'text-blue-400' :
+                         type === 'warning' ? 'text-yellow-400' : 'text-white';
+            
+            logLine.className += ` ${color}`;
+            logLine.textContent = message;
+            
+            logContent.appendChild(logLine);
+            logDisplay.scrollTop = logDisplay.scrollHeight;
+            
+            // Fade in animation
+            setTimeout(() => {
+                logLine.classList.add('opacity-100');
+            }, 50);
+            
+            // Keep only the last 50 messages
+            while (logContent.children.length > 50) {
+                logContent.removeChild(logContent.firstChild);
+            }
+        }
+
+        // WebSocket connection
+        let ws = null;
+        let wsConnected = false;
+
+        function connectWebSocket() {
+            ws = new WebSocket(`ws://${window.location.host}/ws`);
+            
+            ws.onopen = function() {
+                console.log('WebSocket connected');
+                wsConnected = true;
+                addLogMessage('WebSocket connected', 'success');
+            };
+            
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                updateProgress(data);
+            };
+
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                wsConnected = false;
+                addLogMessage('WebSocket connection error', 'error');
+            };
+
+            ws.onclose = function() {
+                console.log('WebSocket closed');
+                wsConnected = false;
+                // Try to reconnect after 1 second
+                setTimeout(connectWebSocket, 1000);
+            };
+        }
+
+        // Initial WebSocket connection
+        connectWebSocket();
+
+        function updateProgress(data) {
+            // Always show progress area when receiving updates
+            progressArea.classList.remove('hidden');
+            
+            const percentage = Math.round((data.current / data.total) * 100);
+            progressBar.style.width = `${percentage}%`;
+            progressPercentage.textContent = `${percentage}%`;
+            
+            const stageText = {
+                'start': 'Starting indexing...',
+                'detection': 'Detecting changes...',
+                'loading': 'Loading files...',
+                'splitting': 'Processing documents...',
+                'storing': 'Storing documents...',
+                'complete': 'Indexing complete'
+            };
+            
+            const stage = stageText[data.stage] || data.stage;
+            progressStage.textContent = stage;
+
+            // Add log message for each progress update
+            if (data.message) {
+                const messageType = data.stage === 'complete' ? 'success' : 
+                                  data.stage === 'error' ? 'error' : 'info';
+                addLogMessage(data.message, messageType);
+            }
+
+            // Only hide on completion after a delay
+            if (data.stage === 'complete') {
+                setTimeout(() => {
+                    progressArea.classList.add('hidden');
+                }, 3000);
+            }
+        }
+
+        function showNotification(message, type = 'success') {
+            notification.className = `mt-4 p-4 rounded-lg ${
+                type === 'success' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
+            }`;
+            notification.textContent = message;
+            notification.classList.remove('hidden');
+            setTimeout(() => {
+                notification.classList.add('hidden');
+            }, 5000);
+        }
+
+        reindexButton.addEventListener('click', async () => {
+            const originalText = reindexButton.innerHTML;
+            reindexButton.disabled = true;
+            reindexButton.innerHTML = `
+                <svg class="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                          d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Reindexing...
+            `;
+
+            // Show progress area immediately
+            progressArea.classList.remove('hidden');
+            logContent.innerHTML = ''; // Clear previous logs
+            addLogMessage('Starting reindex process...', 'info');
+            
+            try {
+                // Create EventSource for progress updates
+                const eventSource = new EventSource('/reindex');
+                
+                eventSource.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        console.log('Progress update:', data);  // Debug log
+                        updateProgress(data);
+                        
+                        if (data.stage === 'complete') {
+                            eventSource.close();
+                            showNotification(data.message, 'success');
+                            addLogMessage('Reindex completed successfully', 'success');
+                            reindexButton.disabled = false;
+                            reindexButton.innerHTML = originalText;
+                        } else if (data.stage === 'error') {
+                            eventSource.close();
+                            showNotification(data.message, 'error');
+                            progressArea.classList.add('hidden');
+                            addLogMessage('Reindex failed: ' + data.message, 'error');
+                            reindexButton.disabled = false;
+                            reindexButton.innerHTML = originalText;
+                        }
+                    } catch (error) {
+                        console.error('Error parsing SSE data:', error);
+                        addLogMessage('Error parsing progress data: ' + error.message, 'error');
+                    }
+                };
+                
+                eventSource.onerror = (error) => {
+                    console.error('SSE Error:', error);
+                    eventSource.close();
+                    showNotification('Error during reindexing. Please try again.', 'error');
+                    progressArea.classList.add('hidden');
+                    addLogMessage('Reindex failed: Connection error', 'error');
+                    reindexButton.disabled = false;
+                    reindexButton.innerHTML = originalText;
+                };
+
+                // Add event listener for connection open
+                eventSource.onopen = () => {
+                    console.log('SSE Connection opened');
+                    addLogMessage('Connected to reindex stream', 'info');
+                };
+            } catch (error) {
+                console.error('Error setting up SSE:', error);
+                showNotification('Error during reindexing. Please try again.', 'error');
+                progressArea.classList.add('hidden');
+                addLogMessage('Reindex failed: ' + error.message, 'error');
+                reindexButton.disabled = false;
+                reindexButton.innerHTML = originalText;
+            }
+        });
+
+        function createMessageElement(content, type = 'user') {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `flex ${type === 'user' ? 'justify-end' : 'justify-start'}`;
+
+            const innerDiv = document.createElement('div');
+            innerDiv.className = `max-w-[80%] rounded-lg p-4 ${
+                type === 'user' 
+                    ? 'bg-blue-500 text-white' 
+                    : 'bg-gray-100 text-gray-800'
+            }`;
+
+            // Parse markdown and render with syntax highlighting
+            if (type === 'assistant') {
+                innerDiv.innerHTML = marked.parse(content);
+                innerDiv.querySelectorAll('pre code').forEach((block) => {
+                    hljs.highlightElement(block);
+                });
+            } else {
+                innerDiv.textContent = content;
+            }
+
+            messageDiv.appendChild(innerDiv);
+            return messageDiv;
+        }
+
+        function appendMessage(content, type = 'user') {
+            const messageElement = createMessageElement(content, type);
+            messagesContainer.appendChild(messageElement);
+            messagesContainer.scrollTop = messagesContainer.scrollHeight;
+        }
+
+        chatForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const question = questionInput.value.trim();
+            if (!question) return;
+
+            // Add user message
+            appendMessage(question, 'user');
+            questionInput.value = '';
+
+            // Show progress area
+            progressArea.classList.remove('hidden');
+            progressBar.style.width = '0%';
+            progressStage.textContent = 'Starting...';
+
+            try {
+                // Create EventSource for progress updates
+                const eventSource = new EventSource('/progress');
+                
+                eventSource.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        console.log('Progress update:', data);  // Debug log
+                        
+                        if (data.stage === 'error') {
+                            eventSource.close();
+                            progressArea.classList.add('hidden');
+                            appendMessage(`Error: ${data.message}`, 'assistant');
+                            return;
+                        }
+                        
+                        updateProgress(data);
+                        
+                        if (data.stage === 'complete') {
+                            eventSource.close();
+                            progressArea.classList.add('hidden');
+                        }
+                    } catch (error) {
+                        console.error('Error parsing progress data:', error);
+                    }
+                };
+
+                const response = await fetch('/ask', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: `question=${encodeURIComponent(question)}`
+                });
+
+                const data = await response.json();
+                eventSource.close();
+                progressArea.classList.add('hidden');
+                
+                // Format the answer with sources
+                let answer = data.answer + '\n\n';
+                if (data.sources && data.sources.length > 0) {
+                    answer += '\n**Sources:**\n';
+                    data.sources.forEach(source => {
+                        answer += `- \`${source}\`\n`;
+                    });
+                }
+
+                appendMessage(answer, 'assistant');
+            } catch (error) {
+                progressArea.classList.add('hidden');
+                appendMessage('Error: Could not get response from server.', 'assistant');
+            }
+        });
+
+        // Fetch repositories when page loads
+        async function fetchRepositories() {
+            try {
+                const response = await fetch('/repositories');
+                const data = await response.json();
+                if (response.ok) {
+                    repositories = data.repositories;
+                }
+            } catch (error) {
+                console.error('Error fetching repositories:', error);
+            }
+        }
+
+        // Initialize repositories
+        fetchRepositories();
+
+        // Handle input changes for repository suggestions
+        questionInput.addEventListener('input', (e) => {
+            const value = e.target.value;
+            const atIndex = value.lastIndexOf('@');
+            
+            if (atIndex !== -1) {
+                const query = value.slice(atIndex + 1).toLowerCase();
+                const matchingRepos = repositories.filter(repo => 
+                    repo.toLowerCase().includes(query)
+                );
+                
+                if (matchingRepos.length > 0) {
+                    showRepoSuggestions(matchingRepos, atIndex);
+                } else {
+                    hideRepoSuggestions();
+                }
+            } else {
+                hideRepoSuggestions();
+            }
+        });
+
+        // Show repository suggestions
+        function showRepoSuggestions(matchingRepos, atIndex) {
+            const inputRect = questionInput.getBoundingClientRect();
+            repoSuggestions.style.top = `${inputRect.bottom}px`;
+            repoSuggestions.innerHTML = matchingRepos.map(repo => `
+                <div class="suggestion-item p-2 hover:bg-gray-100 cursor-pointer" 
+                     data-repo="${repo}">
+                    ${repo}
+                </div>
+            `).join('');
+            
+            repoSuggestions.classList.remove('hidden');
+            showingSuggestions = true;
+
+            // Add click handlers to suggestions
+            repoSuggestions.querySelectorAll('.suggestion-item').forEach(item => {
+                item.addEventListener('click', () => {
+                    const repo = item.dataset.repo;
+                    const beforeAt = questionInput.value.slice(0, atIndex);
+                    const afterAt = questionInput.value.slice(atIndex + 1);
+                    const cursorPos = afterAt.indexOf(' ');
+                    const rest = cursorPos !== -1 ? afterAt.slice(cursorPos) : '';
+                    
+                    questionInput.value = `${beforeAt}@${repo}${rest}`;
+                    hideRepoSuggestions();
+                    questionInput.focus();
+                });
+            });
+        }
+
+        // Hide repository suggestions
+        function hideRepoSuggestions() {
+            repoSuggestions.classList.add('hidden');
+            showingSuggestions = false;
+        }
+
+        // Close suggestions when clicking outside
+        document.addEventListener('click', (e) => {
+            if (showingSuggestions && !repoSuggestions.contains(e.target) && e.target !== questionInput) {
+                hideRepoSuggestions();
+            }
+        });
+
+        // Handle keyboard navigation in suggestions
+        questionInput.addEventListener('keydown', (e) => {
+            if (!showingSuggestions) return;
+            
+            const items = repoSuggestions.querySelectorAll('.suggestion-item');
+            const activeItem = repoSuggestions.querySelector('.bg-gray-100');
+            let activeIndex = Array.from(items).indexOf(activeItem);
+            
+            switch (e.key) {
+                case 'ArrowDown':
+                    e.preventDefault();
+                    if (activeIndex < items.length - 1) {
+                        if (activeItem) activeItem.classList.remove('bg-gray-100');
+                        items[activeIndex + 1].classList.add('bg-gray-100');
+                        items[activeIndex + 1].scrollIntoView({ block: 'nearest' });
+                    }
+                    break;
+                    
+                case 'ArrowUp':
+                    e.preventDefault();
+                    if (activeIndex > 0) {
+                        if (activeItem) activeItem.classList.remove('bg-gray-100');
+                        items[activeIndex - 1].classList.add('bg-gray-100');
+                        items[activeIndex - 1].scrollIntoView({ block: 'nearest' });
+                    }
+                    break;
+                    
+                case 'Enter':
+                    if (activeItem) {
+                        e.preventDefault();
+                        activeItem.click();
+                    }
+                    break;
+                    
+                case 'Escape':
+                    hideRepoSuggestions();
+                    break;
+            }
+        });
+    </script>
+</body>
+</html>
