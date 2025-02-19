@@ -6,7 +6,6 @@ import typer
 from typing import Optional, Callable, Dict, Any, Literal
 from pathlib import Path
 from rich.console import Console
-from rich.progress import Progress
 from langchain_community.document_loaders import TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -17,7 +16,10 @@ from langchain.memory import ConversationBufferMemory
 from dotenv import load_dotenv
 import asyncio
 from langchain.prompts import PromptTemplate
+from langchain.schema import Document
 
+load_dotenv()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 # Initialize rich console for better output
 console = Console()
 app = typer.Typer()
@@ -125,7 +127,7 @@ class RepoAgent:
 
     def __init__(self, repos_path: str,
                  ollama_base_url: Optional[str] = None,
-                 ollama_model: str = "deepseek-r1",
+                 ollama_model: str = OLLAMA_MODEL,
                  progress_callback: Optional[Callable] = None):
         self.repos_path = Path(repos_path)
         self.ollama_base_url = ollama_base_url or "http://localhost:11434"
@@ -158,8 +160,8 @@ class RepoAgent:
         # Enhanced search parameters for better coverage
         self.search_params = {
             "k": 100,
-            "score_threshold": 0.6,
-            "min_sources": 50,
+            "score_threshold": 0.3,
+            "min_sources": 20,
             "max_tokens_per_source": 1000,
             "max_combined_tokens": 6000,
         }
@@ -352,6 +354,43 @@ class RepoAgent:
             
         return needs_reindex, message
 
+    def _get_git_log(self, repo_path: str, max_entries: int = 1000) -> list[dict]:
+        """Get Git log data for a repository"""
+        try:
+            import subprocess
+            
+            # Get git log with structured output
+            cmd = [
+                'git', 'log',
+                '--pretty=format:{%n  "commit": "%H",%n  "author": "%an",%n  "date": "%ai",%n  "message": "%s"%n}',
+                '-n', str(max_entries)
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            # Parse the JSON-like output into a list of dictionaries
+            log_entries = []
+            for entry in result.stdout.strip().split('\n{'):
+                if entry:
+                    # Clean up the entry to make it valid JSON
+                    entry = '{' + entry if not entry.startswith('{') else entry
+                    try:
+                        log_entries.append(json.loads(entry))
+                    except json.JSONDecodeError:
+                        console.print(f"[yellow]Warning: Could not parse git log entry: {entry}")
+                        continue
+            
+            return log_entries
+        except Exception as e:
+            console.print(f"[yellow]Warning: Could not get git log for {repo_path}: {str(e)}")
+            return []
+
     async def index_repositories(self, force_reindex: bool = False):
         """Index all repositories in the specified path"""
         repo_dirs = self._get_repo_dirs()
@@ -402,6 +441,35 @@ class RepoAgent:
             # Process repository files
             documents = []
             file_count = 0
+            
+            # Add Git log data as documents
+            git_log = self._get_git_log(repo_path)
+            if git_log:
+                message = f"📜 Processing Git log for {repo_dir} ({len(git_log)} entries)"
+                console.print(f"[blue]{message}")
+                await self.send_progress("git_log", repo_idx, total_repos, message)
+                
+                for entry in git_log:
+                    # Create a document for each git log entry
+                    content = f"""
+                                Commit: {entry['commit']}
+                                Author: {entry['author']}
+                                Date: {entry['date']}
+                                Message: {entry['message']}
+                                """
+                    documents.append(Document(
+                        page_content=content,
+                        metadata={
+                            'type': 'git_log',
+                            'commit_hash': entry['commit'],
+                            'author': entry['author'],
+                            'date': entry['date'],
+                            'repo_name': repo_dir,
+                            'file_path': '.git/log'  # Virtual path for git log entries
+                        }
+                    ))
+            
+            # Process repository files
             for root, _, files in os.walk(repo_path):
                 if any(excluded in root.split(os.sep) for excluded in self.exclude_dirs):
                     continue
@@ -661,7 +729,7 @@ class RepoAgent:
             for doc, score, repo in filtered_results[:10]:
                 similarity = 1 - score
                 console.print(f"[cyan]- [{repo}] (similarity: {similarity:.4f})")
-                console.print(f"  Source: {doc.metadata['source']}")
+                console.print(f"  File: {doc.metadata.get('file_path', 'unknown')}")
                 preview = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
                 console.print(f"  Content preview: {preview}")
             
@@ -714,6 +782,13 @@ class RepoAgent:
                     if source_count > 0:
                         repo_stats.append(f"{repo} ({source_count} sources)")
                 
+                # Add source documents to the answer
+                source_files = []
+                if "source_documents" in result:
+                    for doc in result["source_documents"]:
+                        if "file_path" in doc.metadata:
+                            source_files.append(f"{doc.metadata['repo_name']}/{doc.metadata['file_path']}")
+                
                 result["answer"] = (
                     f"[Search Statistics]\n"
                     f"- Repositories with matches: {', '.join(repo_stats)}\n"
@@ -721,8 +796,8 @@ class RepoAgent:
                     f"- Similarity threshold: {self.search_params['score_threshold']}\n"
                     f"- Max sources per repository: {k_per_repo}\n\n"
                     f"==============================================\n\n"
-                    f"API Analysis:\n"
-                    f"{result['answer']}"
+                    f"{result['answer']}\n\n"
+                    f"[Sources:\n{chr(10).join(source_files)}]" if source_files else result["answer"]
                 )
             
             return result["answer"]
@@ -734,26 +809,39 @@ class RepoAgent:
     def _get_prompt_template(self) -> PromptTemplate:
         """Get the prompt template for the QA chain"""
         prompt_template = """
-        You are a helpful assistant analyzing code repositories with expertise in microservices analysis. 
-        Your task is to trace and explain flows across different services.
+        You are a highly knowledgeable code analysis assistant with expertise in understanding codebases. Your role is to provide accurate and concise answers about any aspect of the code, including but not limited to:
+
+        1. Configuration values and environment variables
+        2. API endpoints, timeouts, and configurations
+        3. Function implementations and their authors
+        4. Code structure and organization
+        5. Dependencies and external services
+        6. Database schemas and queries
+        7. Authentication and security measures
+        8. Git history and code changes
+        9. Documentation and comments
+        10. Testing and deployment configurations
+
+        When answering questions:
+        - For configuration values: Provide the exact value and where it's defined
+        - For API endpoints: Include the full path, method, and relevant configurations
+        - For function details: Mention the author, location, and key implementation details
+        - For listings (like API endpoints): Present them in a clear, structured format
+        - For Git history: Include relevant commit information and authors
+        - Always cite the specific files and line numbers where information was found
+
+        Use the following context to provide accurate and specific answers.
+        If information is spread across multiple files, combine them to give a complete picture.
+        If you're not completely certain about something, explain what you know and what might need verification.
         
-        You can provide the code snippets and the context to trace the flow and answer the question comprehensively.
-        
-        When analyzing the code, focus on the following:
-        1. The entry points (API endpoints)
-        2. The flow between different services
-        3. The data transformations and business logic
-        4. Any external service calls or dependencies
-        5. The response format and structure
-        
-        Use the following pieces of context to trace the flow and answer the question comprehensively.
-        If you find partial information, explain what you found and try to connect the dots between different services.
-        
+        I need you to answer as a bullet point list.
+
         Context: {context}
-        
+
         Question: {question}
-        
-        Answer: Let me analyze the API flow across the services:"""
+
+        Answer: Let me provide you with the specific information from the codebase:
+        """
 
         return PromptTemplate(
             template=prompt_template,
@@ -763,7 +851,7 @@ class RepoAgent:
 @app.command()
 def setup(repos_path: str = typer.Option(..., help="Path to your repositories folder"),
           ollama_base_url: Optional[str] = typer.Option(None, help="Ollama base URL (default: http://localhost:11434)"),
-          ollama_model: str = typer.Option("deepseek-r1", help="Ollama model to use"),
+          ollama_model: str = typer.Option(OLLAMA_MODEL, help="Ollama model to use"),
           force_reindex: bool = typer.Option(False, help="Force reindexing of all files")):
     """Setup and index your repositories"""
     load_dotenv()
@@ -780,7 +868,7 @@ def setup(repos_path: str = typer.Option(..., help="Path to your repositories fo
 def ask(question: str,
         repos_path: str = typer.Option(..., help="Path to your repositories folder"),
         ollama_base_url: Optional[str] = typer.Option(None, help="Ollama base URL"),
-        ollama_model: str = typer.Option("deepseek-r1", help="Ollama model to use")):
+        ollama_model: str = typer.Option(OLLAMA_MODEL, help="Ollama model to use")):
     """Ask a question about your repositories"""
     load_dotenv()
 

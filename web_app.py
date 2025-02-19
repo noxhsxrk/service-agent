@@ -6,7 +6,7 @@ import uvicorn
 import os
 from pathlib import Path
 from repo_agent import RepoAgent
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 import asyncio
 from typing import List, Set
 import json
@@ -18,6 +18,7 @@ from fastapi import HTTPException
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema.document import Document
 from pydantic import BaseModel
+from tkinter import filedialog, Tk
 
 app = FastAPI()
 load_dotenv()
@@ -34,7 +35,7 @@ templates = Jinja2Templates(directory="templates")
 # Initialize RepoAgent
 REPOS_PATH = os.getenv("REPOS_PATH", ".")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
 
 agent = None
 active_websockets: Set[WebSocket] = set()
@@ -246,7 +247,12 @@ async def get_vector_store_data():
     
     if agent is None:
         if os.path.exists("./repo_index"):
-            agent = RepoAgent(REPOS_PATH, progress_callback=broadcast_progress)
+            agent = RepoAgent(
+                repos_path=REPOS_PATH,
+                ollama_base_url=OLLAMA_BASE_URL,
+                ollama_model=OLLAMA_MODEL,
+                progress_callback=broadcast_progress
+            )
             await init_agent()
         else:
             return JSONResponse(
@@ -269,15 +275,27 @@ async def get_vector_store_data():
             
             # Group documents by source file for this repository
             doc_groups = {}
+            git_log_entries = []
+            
             for i, doc in enumerate(documents['metadatas']):
-                file_path = doc.get('source', 'unknown')
-                if file_path not in doc_groups:
-                    doc_groups[file_path] = {
-                        'file_path': file_path,
-                        'chunks': 0,
-                        'last_modified': doc.get('last_modified', None) or doc.get('mtime', None)
-                    }
-                doc_groups[file_path]['chunks'] += 1
+                file_path = doc.get('file_path', 'unknown')
+                doc_type = doc.get('type', 'file')
+                
+                if doc_type == 'git_log':
+                    git_log_entries.append({
+                        'commit_hash': doc.get('commit_hash'),
+                        'author': doc.get('author'),
+                        'date': doc.get('date'),
+                        'chunks': 1
+                    })
+                else:
+                    if file_path not in doc_groups:
+                        doc_groups[file_path] = {
+                            'file_path': file_path,
+                            'chunks': 0,
+                            'last_modified': doc.get('last_modified', None) or doc.get('mtime', None)
+                        }
+                    doc_groups[file_path]['chunks'] += 1
             
             # Add repository data
             repo_data.append({
@@ -285,6 +303,7 @@ async def get_vector_store_data():
                 'total_files': len(doc_groups),
                 'total_chunks': len(documents['ids']),
                 'documents': list(doc_groups.values()),
+                'git_log': git_log_entries,
                 'last_indexed': agent._load_repo_metadata(repo_name).get('last_indexed', 'Never')
             })
             
@@ -339,7 +358,7 @@ async def get_vector_store_document(path: str):
             # Get the collection's documents
             docs = vector_store._collection.get()
             # Check if the document exists in this repository
-            if any(metadata.get('source') == path for metadata in docs['metadatas']):
+            if any(metadata.get('file_path') == path for metadata in docs['metadatas']):
                 repo_found = repo_name
                 collection = vector_store._collection
                 break
@@ -355,7 +374,7 @@ async def get_vector_store_document(path: str):
         
         chunks = []
         for i, metadata in enumerate(documents['metadatas']):
-            if metadata.get('source') == path:
+            if metadata.get('file_path') == path:
                 chunks.append({
                     'id': documents['ids'][i],
                     'content': documents['documents'][i],
@@ -400,7 +419,7 @@ async def delete_vector_store_document(path: str):
             # Get the collection's documents
             docs = vector_store._collection.get()
             # Check if the document exists in this repository
-            if any(metadata.get('source') == path for metadata in docs['metadatas']):
+            if any(metadata.get('file_path') == path for metadata in docs['metadatas']):
                 repo_found = repo_name
                 collection = vector_store._collection
                 break
@@ -416,7 +435,7 @@ async def delete_vector_store_document(path: str):
         
         ids_to_delete = []
         for i, metadata in enumerate(documents['metadatas']):
-            if metadata.get('source') == path:
+            if metadata.get('file_path') == path:
                 ids_to_delete.append(documents['ids'][i])
         
         if not ids_to_delete:
@@ -695,6 +714,50 @@ async def reindex_repo(request: ReindexRequest):
             'message': str(e)
         })
         raise HTTPException(status_code=500, detail=str(e))
+
+class ReposPathUpdate(BaseModel):
+    repos_path: str
+
+@app.post("/api/pick-folder")
+async def pick_folder():
+    try:
+        # Create and hide the Tkinter root window
+        root = Tk()
+        root.withdraw()
+        
+        # Open the folder picker dialog
+        selected_path = filedialog.askdirectory()
+        root.destroy()
+        
+        if selected_path:
+            return {"success": True, "selected_path": selected_path}
+        else:
+            return {"success": False, "error": "No folder selected"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/update-repos-path")
+async def update_repos_path(path_update: ReposPathUpdate):
+    try:
+        if not path_update.repos_path:
+            return {"success": False, "error": "No path provided"}
+        
+        # Update the .env file
+        env_path = '.env'
+        set_key(env_path, 'REPOS_PATH', path_update.repos_path)
+        
+        # Update environment variables directly
+        global REPOS_PATH
+        REPOS_PATH = path_update.repos_path
+        os.environ["REPOS_PATH"] = path_update.repos_path
+        
+        # Clear existing agent but don't reinitialize
+        global agent
+        agent = None
+        
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 if __name__ == "__main__":
     uvicorn.run("web_app:app", host="0.0.0.0", port=8000, reload=True) 

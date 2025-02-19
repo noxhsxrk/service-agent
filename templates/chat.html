@@ -327,32 +327,6 @@
             progressStage.textContent = 'Starting...';
 
             try {
-                // Create EventSource for progress updates
-                const eventSource = new EventSource('/progress');
-                
-                eventSource.onmessage = (event) => {
-                    try {
-                        const data = JSON.parse(event.data);
-                        console.log('Progress update:', data);  // Debug log
-                        
-                        if (data.stage === 'error') {
-                            eventSource.close();
-                            progressArea.classList.add('hidden');
-                            appendMessage(`Error: ${data.message}`, 'assistant');
-                            return;
-                        }
-                        
-                        updateProgress(data);
-                        
-                        if (data.stage === 'complete') {
-                            eventSource.close();
-                            progressArea.classList.add('hidden');
-                        }
-                    } catch (error) {
-                        console.error('Error parsing progress data:', error);
-                    }
-                };
-
                 const response = await fetch('/ask', {
                     method: 'POST',
                     headers: {
@@ -362,7 +336,6 @@
                 });
 
                 const data = await response.json();
-                eventSource.close();
                 progressArea.classList.add('hidden');
                 
                 // Format the answer with sources
