@@ -19,6 +19,9 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema.document import Document
 from pydantic import BaseModel
 from tkinter import filedialog, Tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+from document_processor import process_documents_parallel, process_document_chunk
 
 app = FastAPI()
 load_dotenv()
@@ -555,6 +558,83 @@ async def reindex_all():
 class ReindexRequest(BaseModel):
     repo_dir: str
 
+async def process_document_chunk(documents_chunk, repo_dir, agent, index_path, progress_callback):
+    try:
+        # Split documents with enhanced metadata
+        text_splitter = RecursiveCharacterTextSplitter(
+            **agent.splitter_settings
+        )
+        splits = text_splitter.split_documents(documents_chunk)
+
+        # Add chunk context to metadata
+        for i, split in enumerate(splits):
+            chunk_size = agent.splitter_settings['chunk_size']
+            chunk_overlap = agent.splitter_settings['chunk_overlap']
+            
+            content_lines = split.page_content.split('\n')
+            start_line = i * (chunk_size - chunk_overlap)
+            end_line = start_line + len(content_lines)
+            
+            split.metadata.update({
+                'chunk_number': i + 1,
+                'total_chunks': len(splits),
+                'start_line': start_line,
+                'end_line': end_line,
+                'preview': next((line.strip() for line in content_lines if line.strip()), '')[:100]
+            })
+
+        # Create vector store for this chunk
+        chunk_store = Chroma.from_documents(
+            documents=splits,
+            persist_directory=f"{index_path}_temp_{multiprocessing.current_process().name}",
+            embedding=agent.embeddings,
+            collection_metadata=agent.collection_metadata
+        )
+        
+        return splits, chunk_store
+    except Exception as e:
+        console.print(f"[red]Error processing document chunk: {str(e)}")
+        return None, None
+
+async def process_documents_parallel(documents, repo_dir, agent, index_path):
+    # Determine number of chunks based on CPU cores
+    num_cores = multiprocessing.cpu_count()
+    chunk_size = max(1, len(documents) // num_cores)
+    document_chunks = [documents[i:i + chunk_size] for i in range(0, len(documents), chunk_size)]
+    
+    all_splits = []
+    chunk_stores = []
+    
+    # Process chunks in parallel using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=num_cores) as executor:
+        # Create tasks for parallel processing
+        tasks = []
+        for chunk in document_chunks:
+            task = asyncio.create_task(process_document_chunk(chunk, repo_dir, agent, index_path, agent.progress_callback))
+            tasks.append(task)
+        
+        # Wait for all tasks to complete
+        results = await asyncio.gather(*tasks)
+        
+        for splits, chunk_store in results:
+            if splits and chunk_store:
+                all_splits.extend(splits)
+                chunk_stores.append(chunk_store)
+    
+    # Merge all chunk stores into final vector store
+    final_store = Chroma.from_documents(
+        documents=all_splits,
+        persist_directory=index_path,
+        embedding=agent.embeddings,
+        collection_metadata=agent.collection_metadata
+    )
+    
+    # Clean up temporary stores
+    for chunk_store in chunk_stores:
+        chunk_store.delete_collection()
+    
+    return final_store, all_splits
+
 @app.post("/reindex-repo")
 async def reindex_repo(request: ReindexRequest):
     """Reindex a specific repository"""
@@ -637,54 +717,9 @@ async def reindex_repo(request: ReindexRequest):
                 'message': 'Splitting documents into chunks...'
             })
             
-            # Split documents with enhanced metadata
-            text_splitter = RecursiveCharacterTextSplitter(
-                **agent.splitter_settings
-            )
-            splits = text_splitter.split_documents(documents)
-
-            # Add chunk context to metadata
-            for i, split in enumerate(splits):
-                chunk_size = agent.splitter_settings['chunk_size']
-                chunk_overlap = agent.splitter_settings['chunk_overlap']
-                
-                # Calculate line numbers based on content
-                content_lines = split.page_content.split('\n')
-                start_line = i * (chunk_size - chunk_overlap)
-                end_line = start_line + len(content_lines)
-                
-                split.metadata.update({
-                    'chunk_number': i + 1,
-                    'total_chunks': len(splits),
-                    'start_line': start_line,
-                    'end_line': end_line,
-                    'preview': next((line.strip() for line in content_lines if line.strip()), '')[:100]
-                })
-                
-                # Report progress for chunk processing
-                if i % 10 == 0:  # Update every 10 chunks to avoid too frequent updates
-                    progress = int((i / len(splits) * 30)) + 50  # 50-80%
-                    await broadcast_progress({
-                        'stage': 'embedding',
-                        'current': progress,
-                        'total': 100,
-                        'message': f'Processing chunk {i + 1}/{len(splits)}'
-                    })
-
-            await broadcast_progress({
-                'stage': 'saving',
-                'current': 80,
-                'total': 100,
-                'message': 'Creating vector store...'
-            })
-
-            # Create vector store for repository
-            agent.vector_stores[repo_dir] = Chroma.from_documents(
-                documents=splits,
-                persist_directory=index_path,
-                embedding=agent.embeddings,
-                collection_metadata=agent.collection_metadata
-            )
+            # Process documents in parallel
+            vector_store, splits = await process_documents_parallel(documents, repo_dir, agent, index_path)
+            agent.vector_stores[repo_dir] = vector_store
 
             # Save repository metadata with current commit hash
             current_commit = agent._get_current_commit_hash(repo_path)

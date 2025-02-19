@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import asyncio
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
+from document_processor import process_documents_parallel, process_document_chunk
 
 load_dotenv()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
@@ -391,85 +392,28 @@ class RepoAgent:
             console.print(f"[yellow]Warning: Could not get git log for {repo_path}: {str(e)}")
             return []
 
-    async def index_repositories(self, force_reindex: bool = False):
-        """Index all repositories in the specified path"""
-        repo_dirs = self._get_repo_dirs()
-        if not repo_dirs:
-            message = "❌ No Git repositories found in the specified path"
-            console.print(f"[red]{message}")
-            await self.send_progress("error", 0, 0, message)
-            return
-            
-        total_repos = len(repo_dirs)
-        message = f"🔍 Found {total_repos} Git repositories to process"
-        console.print(f"[yellow]{message}")
-        await self.send_progress("start", 0, total_repos, message)
-
-        for repo_idx, repo_dir in enumerate(repo_dirs, 1):
+    async def process_single_repository(self, repo_dir: str, repo_idx: int, total_repos: int, force_reindex: bool = False):
+        """Process a single repository and create its vector store"""
+        try:
             repo_path = os.path.join(self.repos_path, repo_dir)
             index_path = self._get_repo_index_path(repo_dir)
             
             # Check repository status
-            message = f"🔍 Checking repository: {repo_dir}"
-            console.print(f"[yellow]{message}")
-            await self.send_progress("check", repo_idx, total_repos, message)
-
-            # Determine if reindexing is needed
-            needs_reindex = force_reindex or not os.path.exists(index_path)
-            if not needs_reindex:
-                needs_reindex, status_message = await self._check_repo_status(repo_dir, repo_path)
-                console.print(f"[{'yellow' if needs_reindex else 'green'}]{status_message}")
-                await self.send_progress("status", repo_idx, total_repos, status_message)
-
-            if not needs_reindex:
-                # Load existing index
-                message = f"📚 Loading existing index for {repo_dir}"
-                console.print(f"[blue]{message}")
-                await self.send_progress("load", repo_idx, total_repos, message)
-                
-                self.vector_stores[repo_dir] = Chroma(
-                    persist_directory=index_path,
-                    embedding_function=self.embeddings,
-                    collection_metadata=self.collection_metadata
-                )
-                continue
-
-            message = f"📝 Indexing repository: {repo_dir}"
-            console.print(f"[yellow]{message}")
-            await self.send_progress("index", repo_idx, total_repos, message)
+            needs_update, status_message = await self._check_repo_status(repo_dir, repo_path)
+            
+            if not needs_update and not force_reindex:
+                console.print(f"[green]✓ Repository {repo_dir} is up to date")
+                return
+            
+            console.print(f"[yellow]⚡ {status_message}")
             
             # Process repository files
             documents = []
             file_count = 0
+            total_files = sum(1 for root, _, files in os.walk(repo_path) 
+                             if not any(excluded in root.split(os.sep) for excluded in self.exclude_dirs)
+                             for file in files if self._is_allowed_file(os.path.join(root, file)))
             
-            # Add Git log data as documents
-            git_log = self._get_git_log(repo_path)
-            if git_log:
-                message = f"📜 Processing Git log for {repo_dir} ({len(git_log)} entries)"
-                console.print(f"[blue]{message}")
-                await self.send_progress("git_log", repo_idx, total_repos, message)
-                
-                for entry in git_log:
-                    # Create a document for each git log entry
-                    content = f"""
-                                Commit: {entry['commit']}
-                                Author: {entry['author']}
-                                Date: {entry['date']}
-                                Message: {entry['message']}
-                                """
-                    documents.append(Document(
-                        page_content=content,
-                        metadata={
-                            'type': 'git_log',
-                            'commit_hash': entry['commit'],
-                            'author': entry['author'],
-                            'date': entry['date'],
-                            'repo_name': repo_dir,
-                            'file_path': '.git/log'  # Virtual path for git log entries
-                        }
-                    ))
-            
-            # Process repository files
             for root, _, files in os.walk(repo_path):
                 if any(excluded in root.split(os.sep) for excluded in self.exclude_dirs):
                     continue
@@ -482,9 +426,14 @@ class RepoAgent:
                             file_docs = loader.load()
                             file_count += 1
                             
-                            if file_count % 100 == 0:  # Report progress every 100 files
-                                message = f"📄 Processed {file_count} files in {repo_dir}"
-                                await self.send_progress("files", repo_idx, total_repos, message)
+                            # Report progress for file processing
+                            progress = int((file_count / total_files) * 40) + 10  # 10-50%
+                            await self.send_progress(
+                                'processing',
+                                progress,
+                                100,
+                                f'Processing file {file_count}/{total_files}: {os.path.relpath(file_path, repo_path)}'
+                            )
                             
                             # Add file path and extension to metadata
                             for doc in file_docs:
@@ -497,45 +446,17 @@ class RepoAgent:
                         console.print(f"[yellow]⚠️  Could not load {file_path}: {str(e)}")
 
             if documents:
-                message = f"✂️  Splitting {len(documents)} documents from {repo_dir}"
-                console.print(f"[blue]{message}")
-                await self.send_progress("split", repo_idx, total_repos, message)
-                
-                # Split documents with enhanced metadata
-                text_splitter = RecursiveCharacterTextSplitter(
-                    **self.splitter_settings
+                console.print(f"✂️  Splitting {len(documents)} documents from {repo_dir}")
+                await self.send_progress(
+                    'splitting',
+                    50,
+                    100,
+                    f'Processing {len(documents)} documents from {repo_dir}'
                 )
-                splits = text_splitter.split_documents(documents)
-
-                # Add chunk context to metadata
-                for i, split in enumerate(splits):
-                    chunk_size = self.splitter_settings['chunk_size']
-                    chunk_overlap = self.splitter_settings['chunk_overlap']
-                    
-                    # Calculate line numbers based on content
-                    content_lines = split.page_content.split('\n')
-                    start_line = i * (chunk_size - chunk_overlap)
-                    end_line = start_line + len(content_lines)
-                    
-                    split.metadata.update({
-                        'chunk_number': i + 1,
-                        'total_chunks': len(splits),
-                        'start_line': start_line,
-                        'end_line': end_line,
-                        'preview': next((line.strip() for line in content_lines if line.strip()), '')[:100]
-                    })
-
-                message = f"💾 Creating vector store for {repo_dir} with {len(splits)} chunks"
-                console.print(f"[blue]{message}")
-                await self.send_progress("store", repo_idx, total_repos, message)
                 
-                # Create vector store for repository
-                self.vector_stores[repo_dir] = Chroma.from_documents(
-                    documents=splits,
-                    persist_directory=index_path,
-                    embedding=self.embeddings,
-                    collection_metadata=self.collection_metadata
-                )
+                # Process documents in parallel
+                vector_store, splits = await process_documents_parallel(documents, repo_dir, self, index_path)
+                self.vector_stores[repo_dir] = vector_store
 
                 # Save repository metadata with current commit hash
                 current_commit = self._get_current_commit_hash(repo_path)
@@ -547,13 +468,85 @@ class RepoAgent:
                         'total_chunks': len(splits)
                     }
                     self._save_repo_metadata(repo_dir, metadata)
-                    message = f"✅ Completed indexing {repo_dir} ({len(documents)} files, {len(splits)} chunks)"
-                    console.print(f"[green]{message}")
-                    await self.send_progress("complete", repo_idx, total_repos, message)
 
-        final_message = f"✨ All {total_repos} Git repositories processed"
-        console.print(f"[green]{final_message}")
-        await self.send_progress("complete", total_repos, total_repos, final_message)
+                # Process git log if available
+                try:
+                    git_log = self._get_git_log(repo_path)
+                    if git_log:
+                        git_docs = []
+                        for entry in git_log:
+                            doc = Document(
+                                page_content=f"{entry['message']}\n\nFiles changed:\n{entry['files']}",
+                                metadata={
+                                    'type': 'git_log',
+                                    'commit_hash': entry['hash'],
+                                    'author': entry['author'],
+                                    'date': entry['date'],
+                                    'repo_name': repo_dir
+                                }
+                            )
+                            git_docs.append(doc)
+                        
+                        if git_docs:
+                            git_store = Chroma.from_documents(
+                                documents=git_docs,
+                                persist_directory=f"{index_path}_git",
+                                embedding=self.embeddings,
+                                collection_metadata=self.collection_metadata
+                            )
+                            # Merge git store into main store
+                            self.vector_stores[repo_dir] = vector_store
+                except Exception as e:
+                    console.print(f"[yellow]⚠️  Could not process git log for {repo_dir}: {str(e)}")
+
+                await self.send_progress(
+                    'complete',
+                    100,
+                    100,
+                    f'Repository {repo_dir} indexed successfully'
+                )
+                
+                console.print(f"[green]✓ Repository {repo_dir} indexed successfully")
+            else:
+                console.print(f"[yellow]⚠️  No documents found in {repo_dir}")
+            
+        except Exception as e:
+            console.print(f"[red]❌ Error processing repository {repo_dir}: {str(e)}")
+            raise
+
+    async def index_repositories(self, force_reindex: bool = False):
+        """Index all repositories in parallel"""
+        repo_dirs = self._get_repo_dirs()
+        if not repo_dirs:
+            message = "❌ No Git repositories found in the specified path"
+            console.print(f"[red]{message}")
+            await self.send_progress("error", 0, 0, message)
+            return
+        
+        total_repos = len(repo_dirs)
+        message = f"🔍 Found {total_repos} Git repositories to process"
+        console.print(f"[yellow]{message}")
+        await self.send_progress("start", 0, total_repos, message)
+
+        # Create tasks for parallel processing
+        tasks = []
+        for repo_idx, repo_dir in enumerate(repo_dirs, 1):
+            task = asyncio.create_task(
+                self.process_single_repository(repo_dir, repo_idx, total_repos, force_reindex)
+            )
+            tasks.append(task)
+        
+        # Wait for all repositories to be processed
+        try:
+            await asyncio.gather(*tasks)
+            final_message = f"✨ All {total_repos} Git repositories processed in parallel"
+            console.print(f"[green]{final_message}")
+            await self.send_progress("complete", total_repos, total_repos, final_message)
+        except Exception as e:
+            error_message = f"❌ Error during parallel repository processing: {str(e)}"
+            console.print(f"[red]{error_message}")
+            await self.send_progress("error", 0, total_repos, error_message)
+            raise
 
     def viewDocument(self, file_path: str) -> dict:
         """Get chunks for a specific document with enhanced context"""
