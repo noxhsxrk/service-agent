@@ -34,7 +34,7 @@ templates = Jinja2Templates(directory="templates")
 # Initialize RepoAgent
 REPOS_PATH = os.getenv("REPOS_PATH", ".")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama2")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 
 agent = None
 active_websockets: Set[WebSocket] = set()

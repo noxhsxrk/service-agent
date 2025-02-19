@@ -125,7 +125,7 @@ class RepoAgent:
 
     def __init__(self, repos_path: str,
                  ollama_base_url: Optional[str] = None,
-                 ollama_model: str = "llama2",
+                 ollama_model: str = "deepseek-r1",
                  progress_callback: Optional[Callable] = None):
         self.repos_path = Path(repos_path)
         self.ollama_base_url = ollama_base_url or "http://localhost:11434"
@@ -276,9 +276,7 @@ class RepoAgent:
                     continue  # Skip the root directory itself
                 
                 repo_dirs.append(rel_path)
-                # Remove all subdirectories since we found a repo
-                dirs[:] = []
-                continue
+                # Continue searching subdirectories
         
         console.print(f"[yellow]Found Git repositories: {repo_dirs}")
         return repo_dirs
@@ -765,7 +763,7 @@ class RepoAgent:
 @app.command()
 def setup(repos_path: str = typer.Option(..., help="Path to your repositories folder"),
           ollama_base_url: Optional[str] = typer.Option(None, help="Ollama base URL (default: http://localhost:11434)"),
-          ollama_model: str = typer.Option("llama2", help="Ollama model to use"),
+          ollama_model: str = typer.Option("deepseek-r1", help="Ollama model to use"),
           force_reindex: bool = typer.Option(False, help="Force reindexing of all files")):
     """Setup and index your repositories"""
     load_dotenv()
@@ -782,7 +780,7 @@ def setup(repos_path: str = typer.Option(..., help="Path to your repositories fo
 def ask(question: str,
         repos_path: str = typer.Option(..., help="Path to your repositories folder"),
         ollama_base_url: Optional[str] = typer.Option(None, help="Ollama base URL"),
-        ollama_model: str = typer.Option("llama2", help="Ollama model to use")):
+        ollama_model: str = typer.Option("deepseek-r1", help="Ollama model to use")):
     """Ask a question about your repositories"""
     load_dotenv()
 
