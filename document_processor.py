@@ -59,10 +59,16 @@ async def process_documents_parallel(documents: List[Any], repo_dir: str, agent:
                 for root, dirs, files in os.walk(index_path):
                     for dir_name in dirs:
                         dir_path = os.path.join(root, dir_name)
-                        os.chmod(dir_path, 0o755)  # rwxr-xr-x
+                        try:
+                            os.chmod(dir_path, 0o755)  # rwxr-xr-x
+                        except Exception as e:
+                            console.print(f"[yellow]Warning: Could not change directory permissions: {str(e)}")
                     for file_name in files:
                         file_path = os.path.join(root, file_name)
-                        os.chmod(file_path, 0o644)  # rw-r--r--
+                        try:
+                            os.chmod(file_path, 0o644)  # rw-r--r--
+                        except Exception as e:
+                            console.print(f"[yellow]Warning: Could not change file permissions: {str(e)}")
                 
                 shutil.rmtree(index_path)
                 console.print(f"[yellow]Cleaned up existing index: {index_path}")
@@ -83,23 +89,15 @@ async def process_documents_parallel(documents: List[Any], repo_dir: str, agent:
         # Create fresh index directory with proper permissions
         os.makedirs(index_path, mode=0o755, exist_ok=True)
 
-        # Determine chunk size based on content
-        if total_content_size > 10 * 1024 * 1024:  # 10MB
-            chunk_size = 1000
-            overlap = 100
-        else:
-            chunk_size = 2000
-            overlap = 200
-
-        # Create text splitter
+        # Split documents
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=overlap,
+            chunk_size=1000,
+            chunk_overlap=200,
             length_function=len,
             separators=["\n\n", "\n", " ", ""]
         )
 
-        # Split documents
+        # Split documents with error handling
         splits = []
         for doc in documents:
             try:
@@ -121,18 +119,24 @@ async def process_documents_parallel(documents: List[Any], repo_dir: str, agent:
         
         for retry in range(max_retries):
             try:
-                # Create vector store with explicit persist
+                # Create temporary directory for vector store
+                temp_index_path = f"{index_path}_temp"
+                if os.path.exists(temp_index_path):
+                    shutil.rmtree(temp_index_path)
+                os.makedirs(temp_index_path, mode=0o755)
+
+                # Create vector store in temporary directory first
                 vector_store = Chroma.from_documents(
                     documents=splits,
                     embedding=agent.embeddings,
-                    persist_directory=index_path,
+                    persist_directory=temp_index_path,
                     collection_metadata=agent.collection_metadata
                 )
                 
                 # Force persist to ensure data is written
                 vector_store.persist()
                 
-                # Verify vector store was created
+                # Verify vector store was created successfully
                 if vector_store._collection is None:
                     raise ValueError("Vector store collection is None")
                 
@@ -142,6 +146,11 @@ async def process_documents_parallel(documents: List[Any], repo_dir: str, agent:
                 if not stored_docs['ids']:
                     raise ValueError("No documents found in vector store after creation")
                 
+                # Move temporary directory to final location
+                if os.path.exists(index_path):
+                    shutil.rmtree(index_path)
+                shutil.move(temp_index_path, index_path)
+                
                 console.print(f"[green]Successfully created vector store with {len(stored_docs['ids'])} documents")
                 return vector_store, splits
 
@@ -150,6 +159,8 @@ async def process_documents_parallel(documents: List[Any], repo_dir: str, agent:
                     console.print(f"[yellow]Retry {retry + 1}/{max_retries}: Vector store creation failed: {str(e)}")
                     # Clean up failed attempt
                     try:
+                        if os.path.exists(temp_index_path):
+                            shutil.rmtree(temp_index_path)
                         if os.path.exists(index_path):
                             shutil.rmtree(index_path)
                         os.makedirs(index_path, mode=0o755, exist_ok=True)

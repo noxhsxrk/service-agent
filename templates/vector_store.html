@@ -336,49 +336,105 @@
         // View document chunks
         async function viewDocument(path) {
             try {
+                // Show loading state
+                const loadingModal = document.createElement('div');
+                loadingModal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4';
+                loadingModal.innerHTML = `
+                    <div class="bg-white rounded-lg p-8 flex items-center gap-4">
+                        <div class="animate-spin rounded-full h-8 w-8 border-4 border-blue-500 border-t-transparent"></div>
+                        <p class="text-lg">Loading document chunks...</p>
+                    </div>
+                `;
+                document.body.appendChild(loadingModal);
+
                 const response = await fetch(`/vector-store-document?path=${encodeURIComponent(path)}`);
                 const data = await response.json();
+                
+                // Remove loading state
+                loadingModal.remove();
                 
                 if (response.ok) {
                     // Create modal to display chunks
                     const modal = document.createElement('div');
                     modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4';
                     
+                    // Helper function to safely get metadata values
+                    const getMetadataValue = (chunk, key, defaultValue = 'N/A') => {
+                        return chunk.metadata && chunk.metadata[key] !== undefined ? chunk.metadata[key] : defaultValue;
+                    };
+                    
                     modal.innerHTML = `
-                        <div class="bg-white rounded-lg max-w-4xl w-full max-h-[90vh] overflow-hidden flex flex-col">
-                            <div class="p-4 border-b flex justify-between items-center">
-                                <div>
-                                    <h3 class="text-lg font-semibold">${formatPath(path)}</h3>
-                                    <p class="text-sm text-gray-500">Total Chunks: ${data.total_chunks}</p>
-                                </div>
-                                <button onclick="this.closest('.fixed').remove()"
-                                        class="text-gray-500 hover:text-gray-700">&times;</button>
-                            </div>
-                            <div class="p-4 overflow-y-auto flex-1">
-                                ${data.chunks.map((chunk, i) => `
-                                    <div class="mb-6 last:mb-0">
-                                        <div class="flex items-center justify-between mb-2">
-                                            <div class="flex items-center gap-2">
-                                                <span class="px-2 py-1 bg-blue-100 text-blue-800 rounded text-sm">
-                                                    ${chunk.metadata.file_context}
-                                                </span>
-                                                ${chunk.metadata.has_previous ? 
-                                                    '<span class="text-gray-500 text-sm">⬆️ Previous Chunk</span>' : ''}
-                                            </div>
-                                            <div class="text-sm text-gray-500">
-                                                Lines ${chunk.metadata.start_line}-${chunk.metadata.end_line}
-                                            </div>
-                                        </div>
-                                        <div class="bg-gray-50 rounded-lg p-4">
-                                            <div class="text-sm text-gray-500 mb-2">
-                                                Preview: ${chunk.metadata.preview}
-                                            </div>
-                                            <pre class="whitespace-pre-wrap text-sm font-mono bg-gray-100 p-4 rounded-lg overflow-x-auto">${chunk.content}</pre>
-                                        </div>
-                                        ${chunk.metadata.has_next ? 
-                                            '<div class="text-center mt-2"><span class="text-gray-500 text-sm">⬇️ Next Chunk</span></div>' : ''}
+                        <div class="bg-white rounded-lg max-w-6xl w-full max-h-[90vh] overflow-hidden flex flex-col">
+                            <div class="p-4 border-b flex justify-between items-center sticky top-0 bg-white z-10">
+                                <div class="flex-1">
+                                    <div class="flex items-center gap-2">
+                                        <h3 class="text-lg font-semibold">${formatPath(path)}</h3>
+                                        <span class="px-2 py-1 bg-blue-100 text-blue-800 rounded-full text-sm">
+                                            ${data.chunks ? data.chunks.length : 0} chunks
+                                        </span>
                                     </div>
-                                `).join('')}
+                                    <p class="text-sm text-gray-500 mt-1">Full path: ${path}</p>
+                                </div>
+                                <div class="flex items-center gap-4">
+                                    <button onclick="this.closest('.fixed').remove()"
+                                            class="text-gray-500 hover:text-gray-700 p-2 rounded-full hover:bg-gray-100">
+                                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                                        </svg>
+                                    </button>
+                                </div>
+                            </div>
+                            <div class="flex-1 overflow-y-auto p-4">
+                                ${data.chunks ? data.chunks.map((chunk, i) => {
+                                    const chunkNumber = getMetadataValue(chunk, 'chunk_number', i + 1);
+                                    const totalChunks = getMetadataValue(chunk, 'total_chunks', data.chunks.length);
+                                    const startLine = getMetadataValue(chunk, 'start_line', '?');
+                                    const endLine = getMetadataValue(chunk, 'end_line', '?');
+                                    const preview = getMetadataValue(chunk, 'preview', 'No preview available');
+                                    const hasPrevious = i > 0;
+                                    const hasNext = i < data.chunks.length - 1;
+                                    
+                                    return `
+                                        <div class="mb-8 last:mb-0" id="chunk-${i}">
+                                            <div class="flex items-center justify-between mb-2 sticky top-0">
+                                                <div class="flex items-center gap-2">
+                                                    <span class="px-3 py-1.5 bg-blue-100 text-blue-800 rounded-full text-sm font-medium">
+                                                        Chunk ${chunkNumber}/${totalChunks}
+                                                    </span>
+                                                    ${hasPrevious ? `
+                                                        <a href="#chunk-${i-1}" class="text-blue-600 hover:text-blue-800 text-sm flex items-center gap-1">
+                                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+                                                            </svg>
+                                                            Previous
+                                                        </a>
+                                                    ` : ''}
+                                                    ${hasNext ? `
+                                                        <a href="#chunk-${i+1}" class="text-blue-600 hover:text-blue-800 text-sm flex items-center gap-1">
+                                                            Next
+                                                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                                                            </svg>
+                                                        </a>
+                                                    ` : ''}
+                                                </div>
+                                                <div class="text-sm text-gray-500">
+                                                    ${startLine !== '?' && endLine !== '?' ? `Lines ${startLine}-${endLine}` : ''}
+                                                </div>
+                                            </div>
+                                            <div class="bg-gray-50 rounded-lg overflow-hidden">
+                                                <div class="bg-gray-100 px-4 py-2 border-b">
+                                                    <div class="text-sm text-gray-600">
+                                                        Preview: ${preview}
+                                                    </div>
+                                                </div>
+                                                <div class="p-4">
+                                                    <pre class="whitespace-pre-wrap text-sm font-mono bg-gray-800 text-gray-100 p-4 rounded-lg overflow-x-auto">${chunk.content || 'No content available'}</pre>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    `;
+                                }).join('') : '<div class="text-center text-gray-500">No chunks available</div>'}
                             </div>
                         </div>
                     `;
@@ -389,12 +445,39 @@
                     modal.addEventListener('click', (e) => {
                         if (e.target === modal) modal.remove();
                     });
+
+                    // Close modal on Escape key
+                    document.addEventListener('keydown', function closeOnEscape(e) {
+                        if (e.key === 'Escape') {
+                            modal.remove();
+                            document.removeEventListener('keydown', closeOnEscape);
+                        }
+                    });
                 } else {
                     throw new Error(data.error || 'Failed to load document chunks');
                 }
             } catch (error) {
                 console.error('Error viewing document:', error);
-                alert('Error viewing document: ' + error.message);
+                // Show error modal
+                const errorModal = document.createElement('div');
+                errorModal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4';
+                errorModal.innerHTML = `
+                    <div class="bg-white rounded-lg p-6 max-w-lg w-full">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="text-lg font-semibold text-red-600">Error Loading Document</h3>
+                            <button onclick="this.closest('.fixed').remove()"
+                                    class="text-gray-500 hover:text-gray-700">&times;</button>
+                        </div>
+                        <p class="text-gray-700 mb-4">${error.message}</p>
+                        <div class="flex justify-end">
+                            <button onclick="this.closest('.fixed').remove()"
+                                    class="px-4 py-2 bg-gray-500 text-white rounded hover:bg-gray-600">
+                                Close
+                            </button>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(errorModal);
             }
         }
 
@@ -430,6 +513,107 @@
             const reindexButton = statusDiv.previousElementSibling;
             
             try {
+                // Create a progress container
+                const progressContainer = document.createElement('div');
+                progressContainer.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50';
+                progressContainer.innerHTML = `
+                    <div class="bg-white rounded-lg p-6 max-w-2xl w-full">
+                        <div class="flex items-center justify-between mb-4">
+                            <h3 class="text-lg font-semibold">Reindexing ${repo}</h3>
+                            <button class="text-gray-500 hover:text-gray-700" onclick="if(confirm('Are you sure you want to cancel reindexing?')) this.closest('.fixed').remove();">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="space-y-4">
+                            <!-- Overall Progress -->
+                            <div>
+                                <div class="flex justify-between mb-1">
+                                    <span class="text-sm font-medium text-gray-700" id="progress-stage">Initializing...</span>
+                                    <span class="text-sm font-medium text-gray-700" id="progress-percentage">0%</span>
+                                </div>
+                                <div class="w-full bg-gray-200 rounded-full h-2">
+                                    <div class="bg-blue-600 h-2 rounded-full transition-all duration-300" id="progress-bar" style="width: 0%"></div>
+                                </div>
+                            </div>
+                            
+                            <!-- Current File -->
+                            <div class="bg-gray-50 rounded-lg p-4">
+                                <div class="text-sm text-gray-600 mb-2">Current File:</div>
+                                <div class="font-mono text-sm" id="current-file">Waiting to start...</div>
+                            </div>
+                            
+                            <!-- Stats -->
+                            <div class="grid grid-cols-2 gap-4">
+                                <div class="bg-gray-50 rounded-lg p-4">
+                                    <div class="text-sm text-gray-600 mb-1">Processed</div>
+                                    <div class="text-lg font-semibold" id="files-processed">0/0</div>
+                                </div>
+                                <div class="bg-gray-50 rounded-lg p-4">
+                                    <div class="text-sm text-gray-600 mb-1">Time Remaining</div>
+                                    <div class="text-lg font-semibold" id="time-remaining">Calculating...</div>
+                                </div>
+                            </div>
+                            
+                            <!-- Log Output -->
+                            <div class="bg-gray-900 text-gray-100 rounded-lg p-4 h-32 overflow-y-auto font-mono text-sm">
+                                <div id="log-output"></div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                document.body.appendChild(progressContainer);
+
+                // Helper function to update progress UI
+                const updateProgress = (data) => {
+                    const progressBar = document.getElementById('progress-bar');
+                    const progressStage = document.getElementById('progress-stage');
+                    const progressPercentage = document.getElementById('progress-percentage');
+                    const currentFile = document.getElementById('current-file');
+                    const filesProcessed = document.getElementById('files-processed');
+                    const timeRemaining = document.getElementById('time-remaining');
+                    const logOutput = document.getElementById('log-output');
+
+                    // Update progress bar and percentage
+                    const percentage = Math.round((data.current / data.total) * 100);
+                    progressBar.style.width = `${percentage}%`;
+                    progressPercentage.textContent = `${percentage}%`;
+                    
+                    // Update stage
+                    progressStage.textContent = data.stage.charAt(0).toUpperCase() + data.stage.slice(1);
+                    
+                    // Add log message
+                    const logEntry = document.createElement('div');
+                    logEntry.className = 'log-entry';
+                    logEntry.textContent = `[${new Date().toLocaleTimeString()}] ${data.message}`;
+                    logOutput.appendChild(logEntry);
+                    logOutput.scrollTop = logOutput.scrollHeight;
+
+                    // Extract file info and counts if available
+                    if (data.message.includes('Processing file')) {
+                        const match = data.message.match(/Processing file (\d+)\/(\d+): (.+)/);
+                        if (match) {
+                            const [_, current, total, file] = match;
+                            currentFile.textContent = file;
+                            filesProcessed.textContent = `${current}/${total}`;
+                            
+                            // Calculate time remaining
+                            const timePerFile = data.elapsed / current;
+                            const remainingFiles = total - current;
+                            const remainingSeconds = timePerFile * remainingFiles;
+                            timeRemaining.textContent = formatTimeRemaining(remainingSeconds);
+                        }
+                    }
+                };
+
+                // Helper function to format time remaining
+                const formatTimeRemaining = (seconds) => {
+                    if (seconds < 60) return `${Math.round(seconds)}s`;
+                    if (seconds < 3600) return `${Math.round(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+                    return `${Math.round(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`;
+                };
+
                 // Disable the button and show initial status
                 reindexButton.disabled = true;
                 statusDiv.innerHTML = '<span class="text-blue-500">Starting reindex...</span>';
@@ -458,28 +642,20 @@
                         if (!event.trim()) continue;
                         
                         const data = JSON.parse(event.replace('data: ', ''));
+                        updateProgress(data);
                         
                         // Update status based on stage
                         switch (data.stage) {
-                            case 'start':
-                                statusDiv.innerHTML = `<span class="text-blue-500">${data.message}</span>`;
-                                break;
-                            case 'processing':
-                            case 'embedding':
-                                statusDiv.innerHTML = `<span class="text-blue-500">${data.message}</span>`;
-                                break;
-                            case 'warning':
-                                console.warn(data.message);
-                                break;
                             case 'complete':
                                 statusDiv.innerHTML = `<span class="text-green-500">${data.message}</span>`;
                                 setTimeout(() => {
-                                    statusDiv.innerHTML = '';
+                                    progressContainer.remove();
                                     location.reload();
                                 }, 2000);
                                 break;
                             case 'error':
                                 statusDiv.innerHTML = `<span class="text-red-500">Error: ${data.message}</span>`;
+                                progressContainer.remove();
                                 break;
                         }
                     }

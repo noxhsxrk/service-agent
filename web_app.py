@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 from document_processor import process_documents_parallel, process_document_chunk
 import shutil
+import time
 
 app = FastAPI()
 load_dotenv()
@@ -314,49 +315,76 @@ async def get_vector_store_data():
             if vector_store is None:
                 continue
                 
-            collection = vector_store._collection
-            documents = collection.get()
-            
-            # Group documents by source file for this repository
-            doc_groups = {}
-            git_log_entries = []
-            
-            for i, doc in enumerate(documents['metadatas']):
-                file_path = doc.get('file_path', 'unknown')
-                doc_type = doc.get('type', 'file')
+            try:
+                collection = vector_store._collection
+                if collection is None:
+                    console.print(f"[yellow]Warning: Null collection for {repo_name}")
+                    continue
+                    
+                documents = collection.get()
+                if not documents or not documents.get('metadatas'):
+                    console.print(f"[yellow]Warning: No documents found for {repo_name}")
+                    continue
                 
-                if doc_type == 'git_log':
-                    git_log_entries.append({
-                        'commit_hash': doc.get('commit_hash'),
-                        'author': doc.get('author'),
-                        'date': doc.get('date'),
-                        'chunks': 1
-                    })
-                else:
-                    if file_path not in doc_groups:
-                        doc_groups[file_path] = {
-                            'file_path': file_path,
-                            'chunks': 0,
-                            'last_modified': doc.get('last_modified', None) or doc.get('mtime', None)
-                        }
-                    doc_groups[file_path]['chunks'] += 1
-            
-            # Add repository data
-            repo_data.append({
-                'name': repo_name,
-                'total_files': len(doc_groups),
-                'total_chunks': len(documents['ids']),
-                'documents': list(doc_groups.values()),
-                'git_log': git_log_entries,
-                'last_indexed': agent._load_repo_metadata(repo_name).get('last_indexed', 'Never')
-            })
-            
-            total_chunks += len(documents['ids'])
-            total_documents += len(doc_groups)
+                # Group documents by source file for this repository
+                doc_groups = {}
+                git_log_entries = []
+                
+                for i, metadata in enumerate(documents['metadatas']):
+                    if not metadata:
+                        continue
+                        
+                    file_path = metadata.get('file_path')
+                    if not file_path:
+                        continue
+                        
+                    doc_type = metadata.get('type', 'file')
+                    
+                    if doc_type == 'git_log':
+                        commit_hash = metadata.get('commit_hash')
+                        author = metadata.get('author')
+                        date = metadata.get('date')
+                        if commit_hash and author and date:
+                            git_log_entries.append({
+                                'commit_hash': commit_hash,
+                                'author': author,
+                                'date': date,
+                                'chunks': 1
+                            })
+                    else:
+                        if file_path not in doc_groups:
+                            doc_groups[file_path] = {
+                                'file_path': file_path,
+                                'chunks': 0,
+                                'last_modified': metadata.get('last_modified') or metadata.get('mtime') or 'Unknown'
+                            }
+                        doc_groups[file_path]['chunks'] += 1
+                
+                # Add repository data
+                repo_metadata = agent._load_repo_metadata(repo_name)
+                repo_entry = {
+                    'name': repo_name,
+                    'total_files': len(doc_groups),
+                    'total_chunks': len(documents['ids']) if documents.get('ids') else 0,
+                    'documents': list(doc_groups.values()),
+                    'git_log': git_log_entries,
+                    'last_indexed': repo_metadata.get('last_indexed', 'Never')
+                }
+                
+                repo_data.append(repo_entry)
+                total_chunks += repo_entry['total_chunks']
+                total_documents += repo_entry['total_files']
+                
+            except Exception as e:
+                console.print(f"[yellow]Warning: Error processing repository {repo_name}: {str(e)}")
+                continue
         
         # Get metadata file info for the last update time
-        metadata_file = Path("./repo_index/file_metadata.json")
-        last_updated = datetime.fromtimestamp(metadata_file.stat().st_mtime).isoformat() if metadata_file.exists() else None
+        try:
+            metadata_file = Path("./repo_index/file_metadata.json")
+            last_updated = datetime.fromtimestamp(metadata_file.stat().st_mtime).isoformat() if metadata_file.exists() else None
+        except Exception:
+            last_updated = None
         
         return {
             "total_repositories": len(repo_data),
@@ -706,23 +734,51 @@ async def reindex_repo(request: ReindexRequest):
         # Clean up any existing index
         if os.path.exists(index_path):
             try:
+                # Ensure all files are writable before removal
+                for root, dirs, files in os.walk(index_path):
+                    for dir_name in dirs:
+                        try:
+                            dir_path = os.path.join(root, dir_name)
+                            os.chmod(dir_path, 0o755)  # rwxr-xr-x
+                        except Exception as e:
+                            console.print(f"[yellow]Warning: Could not change directory permissions: {str(e)}")
+                    for file_name in files:
+                        try:
+                            file_path = os.path.join(root, file_name)
+                            os.chmod(file_path, 0o644)  # rw-r--r--
+                        except Exception as e:
+                            console.print(f"[yellow]Warning: Could not change file permissions: {str(e)}")
+                
                 shutil.rmtree(index_path)
                 console.print(f"[yellow]Cleaned up existing index for {repo_dir}")
             except Exception as e:
                 console.print(f"[yellow]Warning: Could not clean up existing index: {str(e)}")
+                # Try to remove individual files
+                try:
+                    for root, dirs, files in os.walk(index_path):
+                        for file_name in files:
+                            try:
+                                file_path = os.path.join(root, file_name)
+                                os.remove(file_path)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
         
         # Remove from vector stores if exists
         if repo_dir in agent.vector_stores:
             del agent.vector_stores[repo_dir]
 
         async def generate_progress():
+            start_time = time.time()
             try:
                 # Initial progress
                 data = {
                     "stage": "start",
                     "current": 0,
                     "total": 100,
-                    "message": f"Starting {'re' if os.path.exists(index_path) else ''}index of {repo_dir}"
+                    "message": f"Starting {'re' if os.path.exists(index_path) else ''}index of {repo_dir}",
+                    "elapsed": 0
                 }
                 yield f"data: {json.dumps(data)}\n\n"
                 
@@ -732,35 +788,33 @@ async def reindex_repo(request: ReindexRequest):
                 
                 # First pass: count files and build list
                 for root, _, files in os.walk(repo_path):
-                    if any(excluded in root.split(os.sep) for excluded in agent.exclude_dirs):
-                        continue
-                    
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if agent._is_allowed_file(file_path):
-                            total_files += 1
-                            files_to_process.append((file_path, os.path.relpath(file_path, repo_path)))
+                    if not any(excluded in root.split(os.sep) for excluded in agent.exclude_dirs):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            if agent._is_allowed_file(file_path):
+                                rel_path = os.path.relpath(file_path, repo_path)
+                                total_files += 1
+                                files_to_process.append((file_path, rel_path))
                 
                 if total_files == 0:
                     data = {
                         "stage": "error",
                         "current": 0,
                         "total": 100,
-                        "message": "No files to process"
+                        "message": "No files to process",
+                        "elapsed": time.time() - start_time
                     }
                     yield f"data: {json.dumps(data)}\n\n"
                     return
 
-                # Process filesy
-                documents = []
+                # Process files
                 file_count = 0
                 
                 # Process the files we found
                 for file_path, rel_path in files_to_process:
                     try:
-                        loader = TextLoader(file_path)
-                        file_docs = loader.load()
                         file_count += 1
+                        elapsed = time.time() - start_time
                         
                         # Progress update
                         progress = int((file_count / total_files) * 40) + 10
@@ -768,7 +822,8 @@ async def reindex_repo(request: ReindexRequest):
                             "stage": "processing",
                             "current": progress,
                             "total": 100,
-                            "message": f"Processing file {file_count}/{total_files}: {rel_path}"
+                            "message": f"Processing file {file_count}/{total_files}: {rel_path}",
+                            "elapsed": elapsed
                         }
                         yield f"data: {json.dumps(data)}\n\n"
                         
@@ -785,12 +840,13 @@ async def reindex_repo(request: ReindexRequest):
                         documents.extend(file_docs)
                         
                     except Exception as e:
-                        console.print(f"[yellow]⚠️  Could not load {file_path}: {str(e)}")
+                        elapsed = time.time() - start_time
                         data = {
                             "stage": "warning",
                             "current": progress,
                             "total": 100,
-                            "message": f"Warning: Could not load {rel_path}: {str(e)}"
+                            "message": f"Warning: Could not load {rel_path}: {str(e)}",
+                            "elapsed": elapsed
                         }
                         yield f"data: {json.dumps(data)}\n\n"
 
@@ -805,31 +861,51 @@ async def reindex_repo(request: ReindexRequest):
                     
                     try:
                         # Create the index directory if it doesn't exist
-                        os.makedirs(index_path, exist_ok=True)
+                        os.makedirs(index_path, exist_ok=True, mode=0o755)
                         
                         # Process documents in parallel
                         vector_store, splits = await process_documents_parallel(documents, repo_dir, agent, index_path)
-                        if vector_store:
-                            agent.vector_stores[repo_dir] = vector_store
+                        
+                        if vector_store and splits:
+                            # Verify vector store is valid
+                            try:
+                                collection = vector_store._collection
+                                if collection is None:
+                                    raise ValueError("Vector store collection is None")
+                                
+                                stored_docs = collection.get()
+                                if not stored_docs['ids']:
+                                    raise ValueError("No documents found in vector store after creation")
+                                
+                                # Store in agent's vector stores
+                                agent.vector_stores[repo_dir] = vector_store
 
-                            # Save metadata
-                            current_commit = agent._get_current_commit_hash(repo_path)
-                            if current_commit:
-                                metadata = {
-                                    'last_commit_hash': current_commit,
-                                    'last_indexed': datetime.now().isoformat(),
-                                    'total_documents': len(documents),
-                                    'total_chunks': len(splits)
+                                # Save metadata
+                                current_commit = agent._get_current_commit_hash(repo_path)
+                                if current_commit:
+                                    metadata = {
+                                        'last_commit_hash': current_commit,
+                                        'last_indexed': datetime.now().isoformat(),
+                                        'total_documents': len(documents),
+                                        'total_chunks': len(splits)
+                                    }
+                                    agent._save_repo_metadata(repo_dir, metadata)
+
+                                data = {
+                                    "stage": "complete",
+                                    "current": 100,
+                                    "total": 100,
+                                    "message": f"Repository {repo_dir} indexed successfully with {len(stored_docs['ids'])} chunks"
                                 }
-                                agent._save_repo_metadata(repo_dir, metadata)
-
-                            data = {
-                                "stage": "complete",
-                                "current": 100,
-                                "total": 100,
-                                "message": f"Repository {repo_dir} indexed successfully"
-                            }
-                            yield f"data: {json.dumps(data)}\n\n"
+                                yield f"data: {json.dumps(data)}\n\n"
+                            except Exception as e:
+                                data = {
+                                    "stage": "error",
+                                    "current": 0,
+                                    "total": 100,
+                                    "message": f"Error verifying vector store: {str(e)}"
+                                }
+                                yield f"data: {json.dumps(data)}\n\n"
                         else:
                             data = {
                                 "stage": "error",
@@ -860,7 +936,8 @@ async def reindex_repo(request: ReindexRequest):
                     "stage": "error",
                     "current": 0,
                     "total": 100,
-                    "message": str(e)
+                    "message": str(e),
+                    "elapsed": time.time() - start_time
                 }
                 yield f"data: {json.dumps(data)}\n\n"
 
