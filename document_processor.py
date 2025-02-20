@@ -4,8 +4,12 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
 import shutil
 import os
+from indexing_manager import IndexingManager
+import time
+from typing import List, Tuple, Any
 
 console = Console()
 
@@ -31,79 +35,131 @@ async def process_document_chunk(documents_chunk, repo_dir, agent, index_path, p
                 'total_chunks': len(splits),
                 'start_line': start_line,
                 'end_line': end_line,
-                'preview': next((line.strip() for line in content_lines if line.strip()), '')[:100]
+                'preview': next((line.strip() for line in content_lines if line.strip()), '')[:100],
+                'repo_name': repo_dir
             })
 
-        # Create a unique temporary directory for this chunk
-        temp_dir = f"{index_path}_temp_{multiprocessing.current_process().name}"
-        os.makedirs(temp_dir, exist_ok=True)
-
-        # Create vector store for this chunk with a unique collection name
-        chunk_store = Chroma.from_documents(
-            documents=splits,
-            persist_directory=temp_dir,
-            embedding=agent.embeddings,
-            collection_name=f"chunk_{multiprocessing.current_process().name}",
-            collection_metadata=agent.collection_metadata
-        )
-        
-        return splits, chunk_store, temp_dir
+        return splits
     except Exception as e:
         console.print(f"[red]Error processing document chunk: {str(e)}")
-        return None, None, None
+        return None
 
-async def process_documents_parallel(documents, repo_dir, agent, index_path):
-    # Determine number of chunks based on CPU cores
-    num_cores = multiprocessing.cpu_count()
-    chunk_size = max(1, len(documents) // num_cores)
-    document_chunks = [documents[i:i + chunk_size] for i in range(0, len(documents), chunk_size)]
-    
-    all_splits = []
-    temp_dirs = []
-    
+async def process_documents_parallel(documents: List[Any], repo_dir: str, agent: Any, index_path: str) -> Tuple[Chroma, List[Any]]:
+    """Process documents in parallel with improved performance and checkpointing"""
     try:
-        # Process chunks in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            # Create tasks for parallel processing
-            tasks = []
-            for chunk in document_chunks:
-                task = asyncio.create_task(process_document_chunk(chunk, repo_dir, agent, index_path, agent.progress_callback))
-                tasks.append(task)
-            
-            # Wait for all tasks to complete
-            results = await asyncio.gather(*tasks)
-            
-            for splits, _, temp_dir in results:
-                if splits and temp_dir:
-                    all_splits.extend(splits)
-                    temp_dirs.append(temp_dir)
-        
-        # Clean up any existing index
+        # Print initial document stats
+        total_content_size = sum(len(doc.page_content) for doc in documents)
+        console.print(f"\n[blue]Processing {len(documents)} documents for {repo_dir}")
+        console.print(f"[blue]Total content size: {total_content_size / 1024 / 1024:.2f} MB")
+
+        # Clean up existing index with proper error handling
         if os.path.exists(index_path):
-            shutil.rmtree(index_path)
-        
-        # Create the final vector store
-        final_store = Chroma.from_documents(
-            documents=all_splits,
-            persist_directory=index_path,
-            embedding=agent.embeddings,
-            collection_name="main",
-            collection_metadata=agent.collection_metadata
-        )
-        
-        # Clean up temporary directories
-        for temp_dir in temp_dirs:
             try:
-                shutil.rmtree(temp_dir)
+                # Ensure all files are writable before removal
+                for root, dirs, files in os.walk(index_path):
+                    for dir_name in dirs:
+                        dir_path = os.path.join(root, dir_name)
+                        os.chmod(dir_path, 0o755)  # rwxr-xr-x
+                    for file_name in files:
+                        file_path = os.path.join(root, file_name)
+                        os.chmod(file_path, 0o644)  # rw-r--r--
+                
+                shutil.rmtree(index_path)
+                console.print(f"[yellow]Cleaned up existing index: {index_path}")
             except Exception as e:
-                console.print(f"[yellow]Warning: Could not clean up temporary directory {temp_dir}: {str(e)}")
-        
-        return final_store, all_splits
-    except Exception as e:
-        # Clean up temporary directories in case of error
-        for temp_dir in temp_dirs:
+                console.print(f"[yellow]Warning: Could not clean up index: {str(e)}")
+                # Try to remove individual files
+                try:
+                    for root, dirs, files in os.walk(index_path):
+                        for file_name in files:
+                            file_path = os.path.join(root, file_name)
+                            try:
+                                os.remove(file_path)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        # Create fresh index directory with proper permissions
+        os.makedirs(index_path, mode=0o755, exist_ok=True)
+
+        # Determine chunk size based on content
+        if total_content_size > 10 * 1024 * 1024:  # 10MB
+            chunk_size = 1000
+            overlap = 100
+        else:
+            chunk_size = 2000
+            overlap = 200
+
+        # Create text splitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=overlap,
+            length_function=len,
+            separators=["\n\n", "\n", " ", ""]
+        )
+
+        # Split documents
+        splits = []
+        for doc in documents:
             try:
-                shutil.rmtree(temp_dir)
-            except:
-                pass
-        raise e 
+                doc_splits = text_splitter.split_documents([doc])
+                splits.extend(doc_splits)
+            except Exception as e:
+                console.print(f"[yellow]Warning: Failed to split document {doc.metadata.get('file_path', 'unknown')}: {str(e)}")
+                continue
+
+        if not splits:
+            console.print(f"[red]Error: No valid splits generated for {repo_dir}")
+            return None, []
+
+        console.print(f"[blue]Generated {len(splits)} splits")
+
+        # Create vector store with retries and proper error handling
+        max_retries = 3
+        retry_delay = 2
+        
+        for retry in range(max_retries):
+            try:
+                # Create vector store with explicit persist
+                vector_store = Chroma.from_documents(
+                    documents=splits,
+                    embedding=agent.embeddings,
+                    persist_directory=index_path,
+                    collection_metadata=agent.collection_metadata
+                )
+                
+                # Force persist to ensure data is written
+                vector_store.persist()
+                
+                # Verify vector store was created
+                if vector_store._collection is None:
+                    raise ValueError("Vector store collection is None")
+                
+                # Verify documents were added
+                collection = vector_store._collection
+                stored_docs = collection.get()
+                if not stored_docs['ids']:
+                    raise ValueError("No documents found in vector store after creation")
+                
+                console.print(f"[green]Successfully created vector store with {len(stored_docs['ids'])} documents")
+                return vector_store, splits
+
+            except Exception as e:
+                if retry < max_retries - 1:
+                    console.print(f"[yellow]Retry {retry + 1}/{max_retries}: Vector store creation failed: {str(e)}")
+                    # Clean up failed attempt
+                    try:
+                        if os.path.exists(index_path):
+                            shutil.rmtree(index_path)
+                        os.makedirs(index_path, mode=0o755, exist_ok=True)
+                    except Exception as cleanup_error:
+                        console.print(f"[yellow]Warning: Cleanup between retries failed: {str(cleanup_error)}")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    console.print(f"[red]Failed to create vector store after {max_retries} attempts: {str(e)}")
+                    return None, []
+
+    except Exception as e:
+        console.print(f"[red]Error in document processing: {str(e)}")
+        return None, [] 

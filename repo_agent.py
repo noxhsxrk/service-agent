@@ -18,6 +18,8 @@ import asyncio
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from document_processor import process_documents_parallel, process_document_chunk
+from rich.progress import Progress, SpinnerColumn, TimeElapsedColumn
+from indexing_manager import IndexingManager
 
 load_dotenv()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
@@ -129,26 +131,28 @@ class RepoAgent:
     def __init__(self, repos_path: str,
                  ollama_base_url: Optional[str] = None,
                  ollama_model: str = OLLAMA_MODEL,
-                 progress_callback: Optional[Callable] = None):
+                 progress_callback: Optional[Callable] = None,
+                 force_reindex: bool = False,
+                 load_embeddings: bool = True):
         self.repos_path = Path(repos_path)
         self.ollama_base_url = ollama_base_url or "http://localhost:11434"
         self.ollama_model = ollama_model
+        self.force_reindex = force_reindex
         
-        # Initialize Ollama embeddings
-        self.embeddings = OllamaEmbeddings(
-            base_url=self.ollama_base_url,
-            model=self.ollama_model
+        # Initialize Rich progress tracking
+        self.progress = Progress(
+            SpinnerColumn(),
+            *Progress.get_default_columns(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False
         )
         
-        self.vector_stores = {}  # Dictionary to store vector stores for each repo
-        self.qa_chain = None
-        self.memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True,
-            output_key="answer"
-        )
-        self.index_metadata_file = Path("./repo_index/file_metadata.json")
-        self.progress_callback = progress_callback
+        # Time tracking variables
+        self.processing_start_time = None
+        self.files_processed = 0
+        self.total_processing_time = 0
+        self.average_speed = 0
         
         # HNSW index settings for better search performance
         self.collection_metadata = {
@@ -157,6 +161,65 @@ class RepoAgent:
             "hnsw:search_ef": 100,
             "hnsw:M": 32,
         }
+        
+        # Initialize embeddings and vector stores
+        if load_embeddings:
+            try:
+                self.embeddings = OllamaEmbeddings(
+                    base_url=self.ollama_base_url,
+                    model=self.ollama_model
+                )
+                # Test embeddings
+                test_result = self.embeddings.embed_query("test")
+                if not test_result or len(test_result) == 0:
+                    raise ValueError("Embeddings initialization failed - empty result")
+                
+                # Initialize vector stores dict
+                self.vector_stores = {}
+                
+                # Load existing vector stores if available
+                if os.path.exists("./repo_index"):
+                    console.print("[yellow]Loading existing vector stores...")
+                    for repo_dir in self._get_repo_dirs():
+                        index_path = self._get_repo_index_path(repo_dir)
+                        if os.path.exists(index_path):
+                            try:
+                                vector_store = Chroma(
+                                    persist_directory=index_path,
+                                    embedding_function=self.embeddings,
+                                    collection_metadata=self.collection_metadata
+                                )
+                                # Verify vector store
+                                if vector_store._collection is not None:
+                                    stored_docs = vector_store._collection.get()
+                                    if stored_docs['ids']:
+                                        self.vector_stores[repo_dir] = vector_store
+                                        console.print(f"[green]Loaded vector store for {repo_dir} with {len(stored_docs['ids'])} documents")
+                                    else:
+                                        console.print(f"[yellow]Warning: Empty vector store found for {repo_dir}")
+                            except Exception as e:
+                                console.print(f"[yellow]Warning: Could not load vector store for {repo_dir}: {str(e)}")
+                
+                self.qa_chain = None
+                self.memory = ConversationBufferMemory(
+                    memory_key="chat_history",
+                    return_messages=True,
+                    output_key="answer"
+                )
+            except Exception as e:
+                console.print(f"[red]Error initializing embeddings: {str(e)}")
+                self.embeddings = None
+                self.vector_stores = None
+                self.qa_chain = None
+                self.memory = None
+        else:
+            self.embeddings = None
+            self.vector_stores = None
+            self.qa_chain = None
+            self.memory = None
+        
+        self.index_metadata_file = Path("./repo_index/file_metadata.json")
+        self.progress_callback = progress_callback
         
         # Enhanced search parameters for better coverage
         self.search_params = {
@@ -184,8 +247,8 @@ class RepoAgent:
             ]
         }
 
-    async def send_progress(self, stage: str, current: int, total: int, message: str = ""):
-        """Send progress updates through callback"""
+    async def send_progress(self, stage: str, current: int, total: int, message: str = "", extra_info: Optional[Dict] = None):
+        """Enhanced progress reporting with terminal progress bar"""
         if self.progress_callback:
             try:
                 data = {
@@ -194,10 +257,14 @@ class RepoAgent:
                     "total": total,
                     "message": message
                 }
-                # Call the callback directly - it will handle creating the task
-                self.progress_callback(data)
-                # Small delay to allow the event loop to process the callback
-                await asyncio.sleep(0)
+                if extra_info:
+                    data.update(extra_info)
+                # Ensure we await the callback if it's a coroutine
+                if asyncio.iscoroutinefunction(self.progress_callback):
+                    await self.progress_callback(data)
+                else:
+                    self.progress_callback(data)
+                await asyncio.sleep(0)  # Give other tasks a chance to run
             except Exception as e:
                 console.print(f"[yellow]Warning: Progress callback failed: {str(e)}")
 
@@ -393,125 +460,173 @@ class RepoAgent:
             return []
 
     async def process_single_repository(self, repo_dir: str, repo_idx: int, total_repos: int, force_reindex: bool = False):
-        """Process a single repository and create its vector store"""
+        """Process a single repository with terminal progress bar"""
         try:
             repo_path = os.path.join(self.repos_path, repo_dir)
             index_path = self._get_repo_index_path(repo_dir)
             
-            # Check repository status
-            needs_update, status_message = await self._check_repo_status(repo_dir, repo_path)
+            # Initialize indexing manager for checkpointing
+            indexing_manager = IndexingManager(index_path)
             
-            if not needs_update and not force_reindex:
-                console.print(f"[green]✓ Repository {repo_dir} is up to date")
-                return
+            # Reset time tracking variables
+            self.processing_start_time = datetime.now()
+            self.files_processed = 0
+            self.total_processing_time = 0
+            self.average_speed = 0
             
-            console.print(f"[yellow]⚡ {status_message}")
-            
-            # Process repository files
-            documents = []
-            file_count = 0
-            total_files = sum(1 for root, _, files in os.walk(repo_path) 
-                             if not any(excluded in root.split(os.sep) for excluded in self.exclude_dirs)
-                             for file in files if self._is_allowed_file(os.path.join(root, file)))
-            
-            for root, _, files in os.walk(repo_path):
-                if any(excluded in root.split(os.sep) for excluded in self.exclude_dirs):
-                    continue
+            # Create progress tasks
+            with self.progress:
+                repo_task = self.progress.add_task(
+                    f"[cyan]Processing {repo_dir}",
+                    total=100
+                )
                 
-                for file in files:
-                    file_path = os.path.join(root, file)
+                # Check repository status
+                needs_update, status_message = await self._check_repo_status(repo_dir, repo_path)
+                
+                if not needs_update and not (force_reindex or self.force_reindex):
+                    self.progress.update(repo_task, completed=100, description=f"[green]✓ {repo_dir} is up to date")
+                    return
+                
+                self.progress.console.print(f"[yellow]⚡ {status_message}")
+                
+                # Process repository files
+                documents = []
+                file_count = 0
+                
+                # Get checkpoint if exists
+                processed_files, current_chunk = indexing_manager._get_checkpoint(repo_dir)
+                if processed_files and not force_reindex:
+                    self.progress.console.print(f"[yellow]📋 Found checkpoint - Resuming from {len(processed_files)} processed files")
+                
+                # Count total files first
+                total_files = 0
+                files_to_process = []
+                for root, _, files in os.walk(repo_path):
+                    if not any(excluded in root.split(os.sep) for excluded in self.exclude_dirs):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            if self._is_allowed_file(file_path):
+                                rel_path = os.path.relpath(file_path, repo_path)
+                                # Only count files that haven't been processed or if force reindex
+                                if force_reindex or rel_path not in processed_files:
+                                    total_files += 1
+                                    files_to_process.append((file_path, rel_path))
+                
+                if total_files == 0:
+                    self.progress.update(repo_task, completed=100, description=f"[green]✓ {repo_dir} is already up to date")
+                    return
+                
+                files_task = self.progress.add_task(
+                    f"[blue]Processing files",
+                    total=total_files
+                )
+                
+                # Process files
+                for file_path, rel_path in files_to_process:
                     try:
-                        if self._is_allowed_file(file_path):
-                            loader = TextLoader(file_path)
-                            file_docs = loader.load()
-                            file_count += 1
-                            
-                            # Report progress for file processing
-                            progress = int((file_count / total_files) * 40) + 10  # 10-50%
-                            await self.send_progress(
-                                'processing',
-                                progress,
-                                100,
-                                f'Processing file {file_count}/{total_files}: {os.path.relpath(file_path, repo_path)}'
-                            )
-                            
-                            # Add file path and extension to metadata
-                            for doc in file_docs:
-                                doc.metadata['file_path'] = os.path.relpath(file_path, repo_path)
-                                doc.metadata['file_extension'] = os.path.splitext(file_path)[1]
-                                doc.metadata['repo_name'] = repo_dir
-                            
-                            documents.extend(file_docs)
-                    except Exception as e:
-                        console.print(f"[yellow]⚠️  Could not load {file_path}: {str(e)}")
-
-            if documents:
-                console.print(f"✂️  Splitting {len(documents)} documents from {repo_dir}")
-                await self.send_progress(
-                    'splitting',
-                    50,
-                    100,
-                    f'Processing {len(documents)} documents from {repo_dir}'
-                )
-                
-                # Process documents in parallel
-                vector_store, splits = await process_documents_parallel(documents, repo_dir, self, index_path)
-                self.vector_stores[repo_dir] = vector_store
-
-                # Save repository metadata with current commit hash
-                current_commit = self._get_current_commit_hash(repo_path)
-                if current_commit:
-                    metadata = {
-                        'last_commit_hash': current_commit,
-                        'last_indexed': datetime.now().isoformat(),
-                        'total_documents': len(documents),
-                        'total_chunks': len(splits)
-                    }
-                    self._save_repo_metadata(repo_dir, metadata)
-
-                # Process git log if available
-                try:
-                    git_log = self._get_git_log(repo_path)
-                    if git_log:
-                        git_docs = []
-                        for entry in git_log:
-                            doc = Document(
-                                page_content=f"{entry['message']}\n\nFiles changed:\n{entry['files']}",
-                                metadata={
-                                    'type': 'git_log',
-                                    'commit_hash': entry['hash'],
-                                    'author': entry['author'],
-                                    'date': entry['date'],
-                                    'repo_name': repo_dir
-                                }
-                            )
-                            git_docs.append(doc)
+                        loader = TextLoader(file_path)
+                        file_docs = loader.load()
+                        file_count += 1
+                        self.files_processed += 1
                         
-                        if git_docs:
-                            git_store = Chroma.from_documents(
-                                documents=git_docs,
-                                persist_directory=f"{index_path}_git",
-                                embedding=self.embeddings,
-                                collection_metadata=self.collection_metadata
+                        # Calculate time estimates
+                        elapsed_time = (datetime.now() - self.processing_start_time).total_seconds()
+                        if elapsed_time > 0:
+                            self.average_speed = self.files_processed / elapsed_time
+                            estimated_remaining_seconds = (total_files - file_count) / self.average_speed if self.average_speed > 0 else 0
+                            estimated_completion = self._format_time_estimate(estimated_remaining_seconds)
+                            
+                            # Update progress
+                            self.progress.update(
+                                files_task,
+                                advance=1,
+                                description=f"[blue]Processing files ({file_count}/{total_files}) - {estimated_completion} remaining"
                             )
-                            # Merge git store into main store
-                            self.vector_stores[repo_dir] = vector_store
-                except Exception as e:
-                    console.print(f"[yellow]⚠️  Could not process git log for {repo_dir}: {str(e)}")
+                            self.progress.update(repo_task, completed=int((file_count / total_files) * 50))
+                        
+                        # Add file metadata
+                        for doc in file_docs:
+                            doc.metadata.update({
+                                'file_path': rel_path,
+                                'file_extension': os.path.splitext(file_path)[1],
+                                'repo_name': repo_dir,
+                                'last_modified': datetime.fromtimestamp(os.path.getmtime(file_path)).isoformat(),
+                                'file_size': os.path.getsize(file_path)
+                            })
+                        
+                        documents.extend(file_docs)
+                        
+                        # Save checkpoint after each file
+                        processed_files.append(rel_path)
+                        indexing_manager._save_checkpoint(repo_dir, processed_files, file_count)
+                        
+                    except Exception as e:
+                        self.progress.console.print(f"[yellow]⚠️  Could not load {file_path}: {str(e)}")
 
-                await self.send_progress(
-                    'complete',
-                    100,
-                    100,
-                    f'Repository {repo_dir} indexed successfully'
-                )
-                
-                console.print(f"[green]✓ Repository {repo_dir} indexed successfully")
-            else:
-                console.print(f"[yellow]⚠️  No documents found in {repo_dir}")
+                if documents:
+                    doc_count = len(documents)
+                    embedding_task = self.progress.add_task(
+                        f"[magenta]Creating embeddings",
+                        total=doc_count
+                    )
+                    
+                    try:
+                        # Try to load existing vector store first
+                        existing_vector_store = None
+                        try:
+                            if os.path.exists(index_path):
+                                existing_vector_store = Chroma(
+                                    persist_directory=index_path,
+                                    embedding_function=self.embeddings,
+                                    collection_metadata=self.collection_metadata
+                                )
+                                self.progress.console.print(f"[yellow]📚 Found existing vector store for {repo_dir}")
+                        except Exception as e:
+                            self.progress.console.print(f"[yellow]⚠️  Could not load existing vector store: {str(e)}")
+                        
+                        # Process documents in parallel with improved performance
+                        vector_store, splits = await process_documents_parallel(documents, repo_dir, self, index_path)
+                        
+                        if vector_store:
+                            self.vector_stores[repo_dir] = vector_store
+
+                            # Save repository metadata
+                            current_commit = self._get_current_commit_hash(repo_path)
+                            if current_commit:
+                                metadata = {
+                                    'last_commit_hash': current_commit,
+                                    'last_indexed': datetime.now().isoformat(),
+                                    'total_documents': len(documents),
+                                    'total_chunks': len(splits),
+                                    'index_version': '2.0'
+                                }
+                                self._save_repo_metadata(repo_dir, metadata)
+
+                            self.progress.update(repo_task, completed=100, description=f"[green]✓ {repo_dir} indexed successfully")
+                            self.progress.update(embedding_task, completed=doc_count)
+                            
+                            # Only clear checkpoint after successful vector store creation
+                            indexing_manager._save_checkpoint(repo_dir, [], 0)
+                        else:
+                            # If vector store creation failed but we have an existing one, use it
+                            if existing_vector_store:
+                                self.vector_stores[repo_dir] = existing_vector_store
+                                self.progress.console.print(f"[yellow]⚠️  Using existing vector store for {repo_dir}")
+                            else:
+                                self.progress.console.print(f"[red]❌ Failed to create vector store for {repo_dir}")
+                                # Keep the checkpoint for retry
+                    except Exception as e:
+                        self.progress.console.print(f"[red]❌ Error creating vector store for {repo_dir}: {str(e)}")
+                        # If we have an existing vector store, use it
+                        if existing_vector_store:
+                            self.vector_stores[repo_dir] = existing_vector_store
+                            self.progress.console.print(f"[yellow]⚠️  Using existing vector store for {repo_dir}")
+                else:
+                    self.progress.console.print(f"[yellow]⚠️  No documents found in {repo_dir}")
             
         except Exception as e:
-            console.print(f"[red]❌ Error processing repository {repo_dir}: {str(e)}")
+            self.progress.console.print(f"[red]❌ Error processing repository {repo_dir}: {str(e)}")
             raise
 
     async def index_repositories(self, force_reindex: bool = False):
@@ -528,25 +643,25 @@ class RepoAgent:
         console.print(f"[yellow]{message}")
         await self.send_progress("start", 0, total_repos, message)
 
-        # Create tasks for parallel processing
-        tasks = []
-        for repo_idx, repo_dir in enumerate(repo_dirs, 1):
-            task = asyncio.create_task(
-                self.process_single_repository(repo_dir, repo_idx, total_repos, force_reindex)
-            )
-            tasks.append(task)
+        # Initialize vector_stores if None
+        if self.vector_stores is None:
+            self.vector_stores = {}
         
-        # Wait for all repositories to be processed
-        try:
-            await asyncio.gather(*tasks)
-            final_message = f"✨ All {total_repos} Git repositories processed in parallel"
-            console.print(f"[green]{final_message}")
-            await self.send_progress("complete", total_repos, total_repos, final_message)
-        except Exception as e:
-            error_message = f"❌ Error during parallel repository processing: {str(e)}"
-            console.print(f"[red]{error_message}")
-            await self.send_progress("error", 0, total_repos, error_message)
-            raise
+        # Process repositories sequentially for better stability
+        for repo_idx, repo_dir in enumerate(repo_dirs, 1):
+            try:
+                await self.process_single_repository(repo_dir, repo_idx, total_repos, force_reindex)
+                console.print(f"[green]✓ Successfully processed {repo_dir} ({repo_idx}/{total_repos})")
+            except Exception as e:
+                console.print(f"[red]❌ Error processing {repo_dir}: {str(e)}")
+                # Continue with next repository instead of failing completely
+                continue
+        
+        # Verify vector stores were created
+        indexed_repos = list(self.vector_stores.keys())
+        console.print(f"\n[blue]Indexing complete. Indexed repositories: {indexed_repos}")
+        if not indexed_repos:
+            console.print("[red]Warning: No repositories were successfully indexed")
 
     def viewDocument(self, file_path: str) -> dict:
         """Get chunks for a specific document with enhanced context"""
@@ -639,9 +754,17 @@ class RepoAgent:
 
     def ask(self, question: str) -> str:
         """Ask a question about the repositories"""
+        # Check if vector store directory exists
+        if not os.path.exists("./repo_index"):
+            return "Repository index not found. Please initialize the index first using the 'Check Changes' or 'Reindex' button in the Vector Store page."
+
+        # Check if embeddings are loaded
+        if not self.embeddings:
+            return "Error: Embeddings not initialized. Please ensure the agent is properly initialized with load_embeddings=True."
+
+        # Check if vector stores are loaded
         if not self.vector_stores:
-            console.print("[red]Error: No repositories indexed. Please run index_repositories first.")
-            return "Error: No repositories indexed. Please run index_repositories first."
+            return "No repositories are currently indexed. Please visit the Vector Store page to initialize or check the status of your repositories."
 
         try:
             # Debug: Print available repositories
@@ -841,6 +964,20 @@ class RepoAgent:
             input_variables=["context", "question"]
         )
 
+    def _format_time_estimate(self, seconds: float) -> str:
+        """Format time estimate in a human-readable way"""
+        if seconds < 60:
+            return f"{int(seconds)} seconds"
+        elif seconds < 3600:
+            minutes = int(seconds / 60)
+            return f"{minutes} minute{'s' if minutes != 1 else ''}"
+        else:
+            hours = int(seconds / 3600)
+            minutes = int((seconds % 3600) / 60)
+            if minutes > 0:
+                return f"{hours} hour{'s' if hours != 1 else ''} {minutes} minute{'s' if minutes != 1 else ''}"
+            return f"{hours} hour{'s' if hours != 1 else ''}"
+
 @app.command()
 def setup(repos_path: str = typer.Option(..., help="Path to your repositories folder"),
           ollama_base_url: Optional[str] = typer.Option(None, help="Ollama base URL (default: http://localhost:11434)"),
@@ -852,7 +989,8 @@ def setup(repos_path: str = typer.Option(..., help="Path to your repositories fo
     agent = RepoAgent(
         repos_path=repos_path,
         ollama_base_url=ollama_base_url,
-        ollama_model=ollama_model
+        ollama_model=ollama_model,
+        force_reindex=force_reindex
     )
     asyncio.run(agent.index_repositories(force_reindex=force_reindex))
     console.print("[green]Setup complete! You can now ask questions about your repositories.")

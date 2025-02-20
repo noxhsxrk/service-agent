@@ -22,6 +22,7 @@ from tkinter import filedialog, Tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 from document_processor import process_documents_parallel, process_document_chunk
+import shutil
 
 app = FastAPI()
 load_dotenv()
@@ -109,16 +110,23 @@ async def home(request: Request):
 async def ask_question(question: str = Form(...)):
     global agent
     
-    if agent is None:
-        await init_agent()
-        
-    if agent is None:
-        return {
-            "answer": "Error: Failed to initialize Ollama agent. Please check your Ollama configuration.",
-            "sources": []
-        }
-    
     try:
+        # Initialize agent if not already initialized
+        if agent is None:
+            agent = RepoAgent(
+                repos_path=REPOS_PATH,
+                ollama_base_url=OLLAMA_BASE_URL,
+                ollama_model=OLLAMA_MODEL,
+                progress_callback=broadcast_progress
+            )
+            
+            # Only check for index existence, don't create it
+            if not os.path.exists("./repo_index"):
+                return {
+                    "answer": "Repository index not found. Please initialize the index first using the 'Check Changes' or 'Reindex' button in the Vector Store page.",
+                    "sources": []
+                }
+        
         # Parse the query to check if it's repository-specific
         repo_name, actual_question = agent._parse_query(question)
         
@@ -187,15 +195,43 @@ async def reindex():
         async def progress_generator():
             try:
                 # Send initial progress
-                yield f"data: {json.dumps({'stage': 'start', 'current': 0, 'total': 100, 'message': 'Starting reindexing process...'})}\n\n"
+                yield f"data: {json.dumps({'stage': 'start', 'current': 0, 'total': 100, 'message': 'Starting indexing process...'})}\n\n"
                 
                 # Initialize agent with the progress callback
                 global agent
-                if agent is not None:
+                if agent is None:
+                    agent = RepoAgent(
+                        repos_path=REPOS_PATH,
+                        ollama_base_url=OLLAMA_BASE_URL,
+                        ollama_model=OLLAMA_MODEL,
+                        progress_callback=progress_callback
+                    )
+                else:
                     agent.progress_callback = progress_callback
                 
+                # Get list of repositories
+                repo_dirs = agent._get_repo_dirs()
+                if not repo_dirs:
+                    yield f"data: {json.dumps({'stage': 'error', 'current': 0, 'total': 100, 'message': 'No Git repositories found'})}\n\n"
+                    return
+                
+                # Clean up existing indexes
+                repo_index_root = Path("./repo_index")
+                if repo_index_root.exists():
+                    try:
+                        shutil.rmtree(repo_index_root)
+                        console.print("[yellow]Cleaned up existing indexes")
+                    except Exception as e:
+                        console.print(f"[yellow]Warning: Could not clean up indexes: {str(e)}")
+                
+                # Create fresh index directory
+                os.makedirs(repo_index_root, exist_ok=True)
+                
+                # Clear existing vector stores
+                agent.vector_stores = {}
+                
                 # Start reindexing in a separate task
-                reindex_task = asyncio.create_task(init_agent(force_reindex=True))
+                reindex_task = asyncio.create_task(agent.index_repositories(force_reindex=True))
                 
                 try:
                     # Keep yielding progress updates until reindexing is complete
@@ -215,7 +251,7 @@ async def reindex():
                     await reindex_task
                     
                     # Send completion message
-                    yield f"data: {json.dumps({'stage': 'complete', 'current': 100, 'total': 100, 'message': 'Reindexing completed successfully'})}\n\n"
+                    yield f"data: {json.dumps({'stage': 'complete', 'current': 100, 'total': 100, 'message': 'Indexing completed successfully'})}\n\n"
                 
                 except Exception as e:
                     # Cancel reindex task if there's an error
@@ -248,22 +284,27 @@ async def vector_store_ui(request: Request):
 async def get_vector_store_data():
     global agent
     
-    if agent is None:
-        if os.path.exists("./repo_index"):
+    try:
+        # Initialize agent without forcing reindex
+        if agent is None:
             agent = RepoAgent(
                 repos_path=REPOS_PATH,
                 ollama_base_url=OLLAMA_BASE_URL,
                 ollama_model=OLLAMA_MODEL,
                 progress_callback=broadcast_progress
             )
-            await init_agent()
-        else:
-            return JSONResponse(
-                status_code=404,
-                content={"error": "Vector store not initialized. Please reindex first."}
-            )
-    
-    try:
+        
+        # Check if index exists
+        if not os.path.exists("./repo_index"):
+            return {
+                "total_repositories": 0,
+                "total_documents": 0,
+                "total_chunks": 0,
+                "last_updated": None,
+                "repositories": [],
+                "needs_indexing": True
+            }
+            
         # Get all repositories data
         repo_data = []
         total_chunks = 0
@@ -322,9 +363,11 @@ async def get_vector_store_data():
             "total_documents": total_documents,
             "total_chunks": total_chunks,
             "last_updated": last_updated,
-            "repositories": repo_data
+            "repositories": repo_data,
+            "needs_indexing": False
         }
     except Exception as e:
+        console.print(f"[red]Error fetching vector store data: {str(e)}")
         return JSONResponse(
             status_code=500,
             content={"error": f"Error fetching vector store data: {str(e)}"}
@@ -462,23 +505,21 @@ async def delete_vector_store_document(path: str):
 
 @app.get("/repositories")
 async def get_repositories():
-    global agent
-    
-    if agent is None:
-        if os.path.exists("./repo_index"):
-            agent = RepoAgent(REPOS_PATH, progress_callback=broadcast_progress)
-            await init_agent()
-        else:
-            return JSONResponse(
-                status_code=404,
-                content={"error": "Vector store not initialized. Please reindex first."}
-            )
-    
     try:
-        # Get list of repository names
-        repo_names = list(agent.vector_stores.keys())
+        # Create a temporary RepoAgent just for listing repositories
+        temp_agent = RepoAgent(
+            repos_path=REPOS_PATH,
+            ollama_base_url=OLLAMA_BASE_URL,
+            ollama_model=OLLAMA_MODEL,
+            progress_callback=None,  # No need for progress callback
+            load_embeddings=False  # Skip loading embeddings and vector stores
+        )
+        
+        # Get list of repository directories without loading vector stores
+        repo_dirs = temp_agent._get_repo_dirs()
+        
         return {
-            "repositories": repo_names
+            "repositories": repo_dirs
         }
     except Exception as e:
         return JSONResponse(
@@ -648,7 +689,7 @@ async def reindex_repo(request: ReindexRequest):
                 progress_callback=broadcast_progress
             )
         
-        # Decode the repository path by replacing the separator with slashes
+        # Decode the repository path
         repo_dir = request.repo_dir.replace('---', '/')
         
         # Check if repository exists
@@ -661,93 +702,175 @@ async def reindex_repo(request: ReindexRequest):
         
         # Force reindex just this repository
         index_path = agent._get_repo_index_path(repo_dir)
+        
+        # Clean up any existing index
+        if os.path.exists(index_path):
+            try:
+                shutil.rmtree(index_path)
+                console.print(f"[yellow]Cleaned up existing index for {repo_dir}")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not clean up existing index: {str(e)}")
+        
+        # Remove from vector stores if exists
         if repo_dir in agent.vector_stores:
             del agent.vector_stores[repo_dir]
-        
-        await broadcast_progress({
-            'stage': 'scanning',
-            'current': 10,
-            'total': 100,
-            'message': 'Scanning repository files...'
-        })
-        
-        # Process repository files
-        documents = []
-        file_count = 0
-        total_files = sum(1 for root, _, files in os.walk(repo_path) 
-                         if not any(excluded in root.split(os.sep) for excluded in agent.exclude_dirs)
-                         for file in files if agent._is_allowed_file(os.path.join(root, file)))
-        
-        for root, _, files in os.walk(repo_path):
-            if any(excluded in root.split(os.sep) for excluded in agent.exclude_dirs):
-                continue
-            
-            for file in files:
-                file_path = os.path.join(root, file)
-                try:
-                    if agent._is_allowed_file(file_path):
+
+        async def generate_progress():
+            try:
+                # Initial progress
+                data = {
+                    "stage": "start",
+                    "current": 0,
+                    "total": 100,
+                    "message": f"Starting {'re' if os.path.exists(index_path) else ''}index of {repo_dir}"
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+                
+                # Count total files
+                total_files = 0
+                files_to_process = []
+                
+                # First pass: count files and build list
+                for root, _, files in os.walk(repo_path):
+                    if any(excluded in root.split(os.sep) for excluded in agent.exclude_dirs):
+                        continue
+                    
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        if agent._is_allowed_file(file_path):
+                            total_files += 1
+                            files_to_process.append((file_path, os.path.relpath(file_path, repo_path)))
+                
+                if total_files == 0:
+                    data = {
+                        "stage": "error",
+                        "current": 0,
+                        "total": 100,
+                        "message": "No files to process"
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    return
+
+                # Process filesy
+                documents = []
+                file_count = 0
+                
+                # Process the files we found
+                for file_path, rel_path in files_to_process:
+                    try:
                         loader = TextLoader(file_path)
                         file_docs = loader.load()
                         file_count += 1
                         
-                        # Report progress for file processing
-                        progress = int((file_count / total_files) * 40) + 10  # 10-50%
-                        await broadcast_progress({
-                            'stage': 'processing',
-                            'current': progress,
-                            'total': 100,
-                            'message': f'Processing file {file_count}/{total_files}: {os.path.relpath(file_path, repo_path)}'
-                        })
+                        # Progress update
+                        progress = int((file_count / total_files) * 40) + 10
+                        data = {
+                            "stage": "processing",
+                            "current": progress,
+                            "total": 100,
+                            "message": f"Processing file {file_count}/{total_files}: {rel_path}"
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
                         
-                        # Add file path and extension to metadata
+                        # Add metadata
                         for doc in file_docs:
-                            doc.metadata['file_path'] = os.path.relpath(file_path, repo_path)
-                            doc.metadata['file_extension'] = os.path.splitext(file_path)[1]
-                            doc.metadata['repo_name'] = repo_dir
+                            doc.metadata.update({
+                                'file_path': rel_path,
+                                'file_extension': os.path.splitext(file_path)[1],
+                                'repo_name': repo_dir,
+                                'last_modified': datetime.fromtimestamp(os.path.getmtime(file_path)).isoformat(),
+                                'file_size': os.path.getsize(file_path)
+                            })
                         
                         documents.extend(file_docs)
-                except Exception as e:
-                    console.print(f"[yellow]⚠️  Could not load {file_path}: {str(e)}")
+                        
+                    except Exception as e:
+                        console.print(f"[yellow]⚠️  Could not load {file_path}: {str(e)}")
+                        data = {
+                            "stage": "warning",
+                            "current": progress,
+                            "total": 100,
+                            "message": f"Warning: Could not load {rel_path}: {str(e)}"
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
 
-        if documents:
-            await broadcast_progress({
-                'stage': 'splitting',
-                'current': 50,
-                'total': 100,
-                'message': 'Splitting documents into chunks...'
-            })
-            
-            # Process documents in parallel
-            vector_store, splits = await process_documents_parallel(documents, repo_dir, agent, index_path)
-            agent.vector_stores[repo_dir] = vector_store
+                if documents:
+                    data = {
+                        "stage": "embedding",
+                        "current": 50,
+                        "total": 100,
+                        "message": "Creating embeddings and vector store..."
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    
+                    try:
+                        # Create the index directory if it doesn't exist
+                        os.makedirs(index_path, exist_ok=True)
+                        
+                        # Process documents in parallel
+                        vector_store, splits = await process_documents_parallel(documents, repo_dir, agent, index_path)
+                        if vector_store:
+                            agent.vector_stores[repo_dir] = vector_store
 
-            # Save repository metadata with current commit hash
-            current_commit = agent._get_current_commit_hash(repo_path)
-            if current_commit:
-                metadata = {
-                    'last_commit_hash': current_commit,
-                    'last_indexed': datetime.now().isoformat(),
-                    'total_documents': len(documents),
-                    'total_chunks': len(splits)
+                            # Save metadata
+                            current_commit = agent._get_current_commit_hash(repo_path)
+                            if current_commit:
+                                metadata = {
+                                    'last_commit_hash': current_commit,
+                                    'last_indexed': datetime.now().isoformat(),
+                                    'total_documents': len(documents),
+                                    'total_chunks': len(splits)
+                                }
+                                agent._save_repo_metadata(repo_dir, metadata)
+
+                            data = {
+                                "stage": "complete",
+                                "current": 100,
+                                "total": 100,
+                                "message": f"Repository {repo_dir} indexed successfully"
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                        else:
+                            data = {
+                                "stage": "error",
+                                "current": 0,
+                                "total": 100,
+                                "message": f"Failed to create vector store for {repo_dir}"
+                            }
+                            yield f"data: {json.dumps(data)}\n\n"
+                    except Exception as e:
+                        data = {
+                            "stage": "error",
+                            "current": 0,
+                            "total": 100,
+                            "message": f"Error creating vector store: {str(e)}"
+                        }
+                        yield f"data: {json.dumps(data)}\n\n"
+                else:
+                    data = {
+                        "stage": "error",
+                        "current": 0,
+                        "total": 100,
+                        "message": f"No documents found in {repo_dir}"
+                    }
+                    yield f"data: {json.dumps(data)}\n\n"
+                    
+            except Exception as e:
+                data = {
+                    "stage": "error",
+                    "current": 0,
+                    "total": 100,
+                    "message": str(e)
                 }
-                agent._save_repo_metadata(repo_dir, metadata)
+                yield f"data: {json.dumps(data)}\n\n"
 
-            await broadcast_progress({
-                'stage': 'complete',
-                'current': 100,
-                'total': 100,
-                'message': f'Repository {repo_dir} reindexed successfully'
-            })
-
-        return {"status": "success", "message": f"Repository {repo_dir} reindexed successfully"}
+        return StreamingResponse(
+            generate_progress(),
+            media_type="text/event-stream"
+        )
+        
     except Exception as e:
         console.print(f"[red]Error in reindex_repo: {str(e)}")
-        await broadcast_progress({
-            'stage': 'error',
-            'current': 0,
-            'total': 100,
-            'message': str(e)
-        })
         raise HTTPException(status_code=500, detail=str(e))
 
 class ReposPathUpdate(BaseModel):
@@ -795,4 +918,4 @@ async def update_repos_path(path_update: ReposPathUpdate):
         return {"success": False, "error": str(e)}
 
 if __name__ == "__main__":
-    uvicorn.run("web_app:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("web_app:app", host="0.0.0.0", port=8001, reload=True) 
